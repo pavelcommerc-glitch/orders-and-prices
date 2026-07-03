@@ -16,6 +16,9 @@ on:
           - bestparts
           - garazh
           - zapchasti
+          - technozona
+          - doctor_motor
+          - motoparts
       orders_date_from:
         description: 'Заказы начиная с (YYYY-MM-DD)'
         required: false
@@ -99,5 +102,65 @@ jobs:
           STORE_TOKEN: ${{ secrets.WB_TOKEN_Z }}
           STORE_SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID_Z }}
           STORE_NAME: "Запчасти24"
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          ORDERS_DATE_FROM: ${{ github.event.inputs.orders_date_from }}
+
+  technozona:
+    name: Технозона (T)
+    if: ${{ github.event_name == 'schedule' || inputs.store == 'all' || inputs.store == 'technozona' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests gspread google-auth
+      - run: python daily_update.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          STORE_TOKEN: ${{ secrets.WB_TOKEN_T }}
+          STORE_SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID_T }}
+          STORE_NAME: "Технозона"
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          ORDERS_DATE_FROM: ${{ github.event.inputs.orders_date_from }}
+
+  doctor_motor:
+    name: Доктор-Мотор (F)
+    if: ${{ github.event_name == 'schedule' || inputs.store == 'all' || inputs.store == 'doctor_motor' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests gspread google-auth
+      - run: python daily_update.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          STORE_TOKEN: ${{ secrets.WB_TOKEN_F }}
+          STORE_SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID_F }}
+          STORE_NAME: "Доктор-Мотор"
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          ORDERS_DATE_FROM: ${{ github.event.inputs.orders_date_from }}
+
+  motoparts:
+    name: Мотопартс (R)
+    if: ${{ github.event_name == 'schedule' || inputs.store == 'all' || inputs.store == 'motoparts' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests gspread google-auth
+      - run: python daily_update.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          STORE_TOKEN: ${{ secrets.WB_TOKEN_R }}
+          STORE_SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID_R }}
+          STORE_NAME: "Мотопартс"
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           ORDERS_DATE_FROM: ${{ github.event.inputs.orders_date_from }}
