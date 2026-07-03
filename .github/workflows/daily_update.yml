@@ -2,16 +2,29 @@ name: Daily Update
 
 on:
   schedule:
-    - cron: '0 4 * * *'  # каждый день в 07:00 МСК (04:00 UTC)
+    - cron: '0 4 * * *'  # 07:00 МСК
   workflow_dispatch:
     inputs:
+      store:
+        description: 'Магазин'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - motorcraft
+          - bestparts
+          - garazh
+          - zapchasti
       orders_date_from:
-        description: 'Заказы начиная с (YYYY-MM-DD), по умолчанию последние 7 дней'
+        description: 'Заказы начиная с (YYYY-MM-DD)'
         required: false
         default: ''
 
 jobs:
-  update:
+  motorcraft:
+    name: Моторкрафт (C)
+    if: ${{ github.event_name == 'schedule' || inputs.store == 'all' || inputs.store == 'motorcraft' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -20,11 +33,71 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install requests gspread google-auth
-      - name: Run daily update
+      - run: python daily_update.py
         env:
           PYTHONUNBUFFERED: "1"
-          WB_TOKEN: ${{ secrets.WB_TOKEN }}
+          STORE_TOKEN: ${{ secrets.WB_TOKEN }}
+          STORE_SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          STORE_NAME: "Моторкрафт"
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
-          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
           ORDERS_DATE_FROM: ${{ github.event.inputs.orders_date_from }}
-        run: python daily_update.py
+
+  bestparts:
+    name: Бестпартс (B)
+    if: ${{ github.event_name == 'schedule' || inputs.store == 'all' || inputs.store == 'bestparts' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests gspread google-auth
+      - run: python daily_update.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          STORE_TOKEN: ${{ secrets.WB_TOKEN_B }}
+          STORE_SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID_B }}
+          STORE_NAME: "Бестпартс"
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          ORDERS_DATE_FROM: ${{ github.event.inputs.orders_date_from }}
+
+  garazh:
+    name: Гараж Моторс (G)
+    if: ${{ github.event_name == 'schedule' || inputs.store == 'all' || inputs.store == 'garazh' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests gspread google-auth
+      - run: python daily_update.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          STORE_TOKEN: ${{ secrets.WB_TOKEN_G }}
+          STORE_SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID_G }}
+          STORE_NAME: "Гараж Моторс"
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          ORDERS_DATE_FROM: ${{ github.event.inputs.orders_date_from }}
+
+  zapchasti:
+    name: Запчасти24 (Z)
+    if: ${{ github.event_name == 'schedule' || inputs.store == 'all' || inputs.store == 'zapchasti' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests gspread google-auth
+      - run: python daily_update.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          STORE_TOKEN: ${{ secrets.WB_TOKEN_Z }}
+          STORE_SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID_Z }}
+          STORE_NAME: "Запчасти24"
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          ORDERS_DATE_FROM: ${{ github.event.inputs.orders_date_from }}
