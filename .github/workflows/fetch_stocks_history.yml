@@ -1,0 +1,20 @@
+name: Fetch Stocks History
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * *'  # каждый день в 04:00 UTC
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - run: pip install gspread google-auth requests
+      - run: python fetch_stocks_history.py
+        env:
+          WB_TOKEN: ${{ secrets.WB_TOKEN }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
