@@ -1,0 +1,27 @@
+name: Fetch Stocks History (все магазины)
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 3 * * *'   # каждый день в 03:00 UTC — поправь под себя
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false   # если один магазин упал — остальные всё равно продолжат
+      matrix:
+        store: [MOTORKRAFT, B, F, G, R, T, Z]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - run: pip install gspread google-auth requests
+      - name: Run for ${{ matrix.store }}
+        run: python fetch_stocks_history.py
+        env:
+          # для основного (Моторкрафт) секреты без суффикса, для остальных — с суффиксом _B/_F/_G/_R/_T/_Z
+          WB_TOKEN: ${{ matrix.store == 'MOTORKRAFT' && secrets.WB_TOKEN || secrets[format('WB_TOKEN_{0}', matrix.store)] }}
+          SPREADSHEET_ID: ${{ matrix.store == 'MOTORKRAFT' && secrets.SPREADSHEET_ID || secrets[format('SPREADSHEET_ID_{0}', matrix.store)] }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
