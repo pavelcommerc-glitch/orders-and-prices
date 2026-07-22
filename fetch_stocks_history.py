@@ -277,7 +277,38 @@ except Exception:
     print("  Лист 'stocks_history' создан")
 
 if TODAY in existing_dates:
-    print(f"⚠️  Остатки за {TODAY} уже записаны — пропускаем")
+    print(f"⚠️  Остатки за {TODAY} уже записаны — пропускаем запись stocks_history")
+    skip_stocks_write = True
+else:
+    skip_stocks_write = False
+
+# ── 5а. Перезаписываем справочник nomenclature (артикул -> название) ──
+# Отдельный маленький лист, чтобы Apps Script мог брать оттуда названия
+# для 'Динамика', не перелопачивая всю (растущую) историю stocks_history.
+print("\n→ Шаг 5а: Обновляем справочник 'nomenclature'...")
+
+NOM_HEADERS = ['Артикул поставщика', 'nmID', 'Название']
+nom_rows = []
+for nm_id, (article, name) in nm_to_article.items():
+    if article:
+        nom_rows.append([article, nm_id, name])
+nom_rows.sort(key=lambda x: x[0])
+
+try:
+    nom_ws = sh.worksheet('nomenclature')
+    nom_ws.clear()
+except Exception:
+    nom_ws = sh.add_worksheet(title='nomenclature', rows=len(nom_rows) + 10, cols=3)
+
+nom_ws.update('A1', [NOM_HEADERS] + nom_rows, value_input_option='USER_ENTERED')
+nom_ws.format('A1:C1', {
+    'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
+    'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18},
+})
+nom_ws.freeze(rows=1)
+print(f"  Записано в 'nomenclature': {len(nom_rows)} артикулов")
+
+if skip_stocks_write:
     exit(0)
 
 batch_size = 2000
