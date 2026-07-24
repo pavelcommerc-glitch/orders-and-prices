@@ -192,6 +192,12 @@ else:
         print(f"  → Склад ФБС '{wh_name}' (id={wh_id})")
 
         nm_quantity = {}  # nmId -> суммарный остаток по этому складу ФБС
+        # ВАЖНО: инициализируем нулями ВСЕ артикулы, у которых есть баркод на
+        # этом складе — иначе если товар распродан (amount=0), для него сегодня
+        # вообще не будет строки, и Sheets-формулы (которые ищут "последнюю
+        # дату с данными по ФБС") найдут устаревшую дату с ненулевым остатком.
+        nm_quantity = {nm_id: 0 for nm_id in set(barcode_to_nm.values())}
+
         batch_size = 1000
         for i in range(0, len(all_barcodes), batch_size):
             batch = all_barcodes[i:i + batch_size]
@@ -203,11 +209,11 @@ else:
                 sku = s.get('sku', '')
                 amount = s.get('amount', 0) or 0
                 nm_id = barcode_to_nm.get(sku)
-                if nm_id and amount:
+                if nm_id:
                     nm_quantity[nm_id] = nm_quantity.get(nm_id, 0) + amount
             time.sleep(0.3)
 
-        print(f"    Артикулов с остатком на этом складе: {len(nm_quantity)}")
+        print(f"    Артикулов на этом складе (включая нулевые): {len(nm_quantity)}")
         for nm_id, qty in nm_quantity.items():
             article, name = nm_to_article.get(nm_id, ('', ''))
             fbs_rows_extra.append([
