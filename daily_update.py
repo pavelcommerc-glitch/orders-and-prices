@@ -1,45 +1,9 @@
 """
-Каждый день снимает текущие остатки ФБО по всем артикулам и дописывает
-в лист 'stocks_history'. Так накапливается история остатков по дням.
+Ежедневный скрипт для всех магазинов:
+  1. Дописывает новые заказы в лист 'orders' (накопительно)
+  2. Дописывает текущие цены в лист 'prices' (история цен)
 
-ОБНОВЛЕНО: старый метод GET /api/v1/supplier/stocks отключён Wildberries
-(https://dev.wildberries.ru/release-notes?id=494). Теперь используется:
-
-  POST https://seller-analytics-api.wildberries.ru/api/analytics/v1/stocks-report/wb-warehouses
-  Категория токена: Analytics (Personal или Service)
-
-ВАЖНО: новый метод возвращает только nmId (числовой ID WB) и chrtId —
-БЕЗ артикула поставщика и названия. Поэтому скрипт сначала выкачивает
-АКТУАЛЬНЫЙ справочник nmId → (артикул поставщика, название) через
-Content API (список карточек товаров, все карточки, не только те,
-что недавно заказывали):
-
-  POST https://content-api.wildberries.ru/content/v2/get/cards/list
-  Категория токена: Content
-
-ДОБАВЛЕНО: остатки ФБС (свой склад, зарегистрированный в WB) —
-дописываются в тот же лист, отдельными строками со Складом = "ФБС":
-
-  GET  https://marketplace-api.wildberries.ru/api/v3/warehouses          — список складов ФБС
-  POST https://marketplace-api.wildberries.ru/api/v3/stocks/{warehouseId} — остатки по баркодам
-  Категория токена: Marketplace
-
-Лист 'stocks_history' (структура не менялась, чтобы старая история осталась совместима):
-  A = Дата снятия
-  B = Артикул поставщика
-  C = nmID
-  D = Название
-  E = Склад
-  F = Количество
-  G = В пути к клиенту
-  H = В пути от клиента
-
-Запуск:
-  export WB_TOKEN='...'              (токен с категориями Analytics, Content И Marketplace!)
-  export GOOGLE_CREDENTIALS='{"type":"service_account",...}'
-  export SPREADSHEET_ID='...'
-  pip install gspread google-auth requests
-  python fetch_stocks_history.py
+Запускается для каждого магазина отдельно через переменные STORE_TOKEN и STORE_SPREADSHEET_ID.
 """
 
 import os
@@ -48,14 +12,15 @@ import time
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ── Авторизация ──────────────────────────────────────────────────
-WB_TOKEN = os.environ['WB_TOKEN']
+WB_TOKEN = os.environ['STORE_TOKEN']
 HEADERS = {'Authorization': WB_TOKEN, 'Content-Type': 'application/json'}
-ANALYTICS_URL = 'https://seller-analytics-api.wildberries.ru'
-CONTENT_URL = 'https://content-api.wildberries.ru'
-MARKETPLACE_URL = 'https://marketplace-api.wildberries.ru'
+STATS_URL  = 'https://statistics-api.wildberries.ru'
+PRICES_URL = 'https://discounts-prices-api.wildberries.ru'
+
+STORE_NAME = os.environ.get('STORE_NAME', 'unknown')
 
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -64,13 +29,16 @@ SCOPES = [
 creds_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
 creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 gc = gspread.authorize(creds)
-sh = gc.open_by_key(os.environ['SPREADSHEET_ID'])
+sh = gc.open_by_key(os.environ['STORE_SPREADSHEET_ID'])
 
 TODAY = datetime.now().strftime('%Y-%m-%d')
-print(f"Дата снятия остатков: {TODAY}")
+ORDERS_DATE_FROM = os.environ.get('ORDERS_DATE_FROM', '').strip() or \
+    (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
 
+print(f"{'='*50}")
+print(f"Магазин: {STORE_NAME} | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+print(f"{'='*50}")
 
-# ── Вспомогательная функция для GET с ретраями ────────────────────
 def wb_get(url, params=None, retries=5):
     for attempt in range(retries):
         try:
@@ -82,7 +50,7 @@ def wb_get(url, params=None, retries=5):
                 continue
             if r.status_code == 200:
                 return r.json()
-            print(f"  Ошибка {r.status_code}: {r.text[:300]}")
+            print(f"  Ошибка {r.status_code}: {r.text[:200]}")
             return None
         except Exception as e:
             print(f"  Исключение: {e}")
@@ -90,302 +58,153 @@ def wb_get(url, params=None, retries=5):
     return None
 
 
-# ── Вспомогательная функция для POST с ретраями ──────────────────
-def wb_post(url, body, retries=5):
-    for attempt in range(retries):
-        try:
-            r = requests.post(url, headers=HEADERS, json=body, timeout=60)
-            if r.status_code == 429:
-                wait = 60 * (attempt + 1)
-                print(f"  ⏳ 429 — жду {wait}с (попытка {attempt+1}/{retries})...")
-                time.sleep(wait)
-                continue
-            if r.status_code == 200:
-                return r.json()
-            print(f"  Ошибка {r.status_code}: {r.text[:300]}")
-            return None
-        except Exception as e:
-            print(f"  Исключение: {e}")
-            time.sleep(10)
-    return None
+# ================================================================
+# 1. ЗАКАЗЫ
+# ================================================================
+print("\n→ Шаг 1: Загружаем заказы...")
 
-
-# ── 1. Справочник nmId -> (артикул, название) через Content API ──
-print("\n→ Шаг 1: Выкачиваем актуальный список карточек товаров (Content API)...")
-
-nm_to_article = {}
-barcode_to_nm = {}  # для сопоставления остатков ФБС (по баркоду) обратно к артикулу
-content_api_failed = False
-cursor = {"limit": 100}
-page = 0
-while True:
-    page += 1
-    body = {"settings": {"cursor": cursor, "filter": {"withPhoto": -1}}}
-    resp = wb_post(f'{CONTENT_URL}/content/v2/get/cards/list', body)
-    if not resp:
-        print(f"⚠️  Не удалось получить список карточек (страница {page}) — "
-              f"пробуем взять справочник из кэша (листы 'nomenclature'/'barcodes' "
-              f"с прошлого удачного запуска), не останавливаемся.")
-        content_api_failed = True
-        break
-
-    cards = resp.get('cards', [])
-    for c in cards:
-        nm_id = str(c.get('nmID', ''))
-        vendor_code = (c.get('vendorCode') or '').strip()
-        title = (c.get('title') or c.get('subjectName') or '').strip()
-        if nm_id:
-            nm_to_article[nm_id] = (vendor_code, title)
-            for size in c.get('sizes', []):
-                for sku in size.get('skus', []):
-                    barcode_to_nm[sku] = nm_id
-
-    next_cursor = resp.get('cursor', {})
-    total = next_cursor.get('total', 0)
-    print(f"  Страница {page}: получено {len(cards)} карточек (total={total})")
-
-    if total < cursor['limit']:
-        break
-    cursor = {
-        "limit": 100,
-        "updatedAt": next_cursor.get('updatedAt'),
-        "nmID": next_cursor.get('nmID'),
-    }
-    time.sleep(0.3)
-
-if content_api_failed:
-    # Пробуем восстановить справочник из кэш-листов, записанных прошлым удачным запуском.
-    try:
-        nom_ws_cache = sh.worksheet('nomenclature')
-        nom_data = nom_ws_cache.get_all_values()[1:]  # без заголовка
-        for row in nom_data:
-            if len(row) >= 3 and row[1]:
-                article, nm_id, name = row[0], row[1], row[2]
-                nm_to_article[nm_id] = (article, name)
-        print(f"  Из кэша 'nomenclature' восстановлено: {len(nm_to_article)} карточек")
-    except Exception as e:
-        print(f"  ⚠️ Не удалось прочитать кэш 'nomenclature': {e}")
-
-    try:
-        bc_ws_cache = sh.worksheet('barcodes')
-        bc_data = bc_ws_cache.get_all_values()[1:]
-        for row in bc_data:
-            if len(row) >= 2 and row[0]:
-                barcode_to_nm[row[0]] = row[1]
-        print(f"  Из кэша 'barcodes' восстановлено: {len(barcode_to_nm)} баркодов")
-    except Exception as e:
-        print(f"  ⚠️ Не удалось прочитать кэш 'barcodes' (возможно, его ещё не было "
-              f"на прошлых запусках) — блок ФБС может отработать не полностью: {e}")
-
-    if not nm_to_article:
-        print("❌ Ни живых данных, ни кэша нет — выходим совсем")
-        exit(1)
-    print(f"  ⚠️ РАБОТАЕМ ПО КЭШУ (не сегодняшний список карточек) — "
-          f"новые/удалённые товары после последнего удачного запуска Content API не учтены.")
-
-print(f"  Всего карточек в справочнике: {len(nm_to_article)}")
-
-# ── 2. Получаем остатки ФБО по новому методу ─────────────────────
-print("\n→ Шаг 2: Получаем текущие остатки ФБО (новый Analytics-метод)...")
-
-endpoint = f'{ANALYTICS_URL}/api/analytics/v1/stocks-report/wb-warehouses'
-result = wb_post(endpoint, body={})
-
-if not result:
-    print("❌ Нет ответа от API — выходим")
-    exit(1)
-
-items = result.get('data', {}).get('items', [])
-print(f"Итого строк остатков (по складам): {len(items)}")
-
-if not items:
-    print("❌ Остатки не получены — выходим")
-    exit(1)
-
-# ПРЕДУПРЕЖДЕНИЕ: если каталог сильно вырастет и WB введёт пагинацию
-# в этом методе (курсор/лимит), этот блок придётся дополнить постраничным сбором.
-# На момент написания (1128 строк) ответ пришёл одним пакетом без курсора.
-
-# ── 3. Получаем остатки ФБС (свой склад) ──────────────────────────
-print("\n→ Шаг 3: Получаем остатки ФБС (свой склад)...")
-
-fbs_rows_extra = []
-warehouses = wb_get(f'{MARKETPLACE_URL}/api/v3/warehouses')
-
-if not warehouses:
-    print("⚠️  Не удалось получить список складов ФБС (нет доступа Marketplace API "
-          "или складов ФБС не заведено) — пропускаем блок ФБС")
-else:
-    print(f"  Складов ФБС найдено: {len(warehouses)}")
-    all_barcodes = list(barcode_to_nm.keys())
-    print(f"  Баркодов для проверки остатков: {len(all_barcodes)}")
-
-    for wh in warehouses:
-        wh_id = wh.get('id')
-        wh_name = wh.get('name', f'ФБС {wh_id}')
-        print(f"  → Склад ФБС '{wh_name}' (id={wh_id})")
-
-        nm_quantity = {}  # nmId -> суммарный остаток по этому складу ФБС
-        # ВАЖНО: инициализируем нулями ВСЕ артикулы, у которых есть баркод на
-        # этом складе — иначе если товар распродан (amount=0), для него сегодня
-        # вообще не будет строки, и Sheets-формулы (которые ищут "последнюю
-        # дату с данными по ФБС") найдут устаревшую дату с ненулевым остатком.
-        nm_quantity = {nm_id: 0 for nm_id in set(barcode_to_nm.values())}
-
-        batch_size = 1000
-        for i in range(0, len(all_barcodes), batch_size):
-            batch = all_barcodes[i:i + batch_size]
-            resp = wb_post(f'{MARKETPLACE_URL}/api/v3/stocks/{wh_id}', body={"skus": batch})
-            if not resp:
-                print(f"    ⚠️ Не удалось получить остатки для батча {i}-{i+len(batch)}")
-                continue
-            for s in resp.get('stocks', []):
-                sku = s.get('sku', '')
-                amount = s.get('amount', 0) or 0
-                nm_id = barcode_to_nm.get(sku)
-                if nm_id:
-                    nm_quantity[nm_id] = nm_quantity.get(nm_id, 0) + amount
-            time.sleep(0.3)
-
-        print(f"    Артикулов на этом складе (включая нулевые): {len(nm_quantity)}")
-        for nm_id, qty in nm_quantity.items():
-            article, name = nm_to_article.get(nm_id, ('', ''))
-            fbs_rows_extra.append([
-                TODAY, article, nm_id, name, 'ФБС', qty, 0, 0,
-            ])
-
-print(f"  Строк ФБС для добавления: {len(fbs_rows_extra)}")
-
-# ── 4. Формируем строки для записи ───────────────────────────────
-print("\n→ Шаг 4: Формируем строки...")
-
-rows = []
-unmatched_nm = set()
-for item in items:
-    nm_id = str(item.get('nmId', ''))
-    warehouse = item.get('warehouseName', '')
-    quantity = item.get('quantity', 0) or 0
-    in_way_to = item.get('inWayToClient', 0) or 0
-    in_way_from = item.get('inWayFromClient', 0) or 0
-
-    article, name = nm_to_article.get(nm_id, ('', ''))
-    if not article:
-        unmatched_nm.add(nm_id)
-
-    rows.append([
-        TODAY,
-        article,
-        nm_id,
-        name,
-        warehouse,
-        quantity,
-        in_way_to,
-        in_way_from,
-    ])
-
-rows.extend(fbs_rows_extra)
-
-print(f"Строк для записи (ФБО + ФБС): {len(rows)}")
-if unmatched_nm:
-    print(f"⚠️  Не нашли артикул для {len(unmatched_nm)} nmId "
-          f"(нет такой карточки в Content API — возможно, товар удалён/в корзине). "
-          f"Примеры: {list(unmatched_nm)[:10]}")
-
-# ── 5. Дописываем в лист stocks_history ───────────────────────────
-print("\n→ Шаг 5: Дописываем в Google Sheets...")
-
-HEADERS_ROW = ['Дата', 'Артикул поставщика', 'nmID', 'Название',
-               'Склад', 'Количество', 'В пути к клиенту', 'В пути от клиента']
+ORDERS_HEADERS = ['Дата заказа', 'Артикул поставщика', 'Название', 'Категория',
+                  'Бренд', 'Цена, ₽', 'Цена со скидкой, ₽', 'Склад', 'Регион',
+                  'Статус отмены', 'srid', 'nmID']
 
 try:
-    ws = sh.worksheet('stocks_history')
-    existing = ws.get_all_values()
+    ws_orders = sh.worksheet('orders')
+    existing_orders = ws_orders.get_all_values()
+    if not existing_orders:
+        ws_orders.append_row(ORDERS_HEADERS)
+        existing_srids = set()
+    else:
+        existing_srids = set(row[10] for row in existing_orders[1:] if len(row) > 10 and row[10])
+    print(f"  Уже в таблице: {len(existing_srids)} заказов")
+except Exception:
+    ws_orders = sh.add_worksheet(title='orders', rows=100000, cols=12)
+    ws_orders.append_row(ORDERS_HEADERS)
+    ws_orders.format('A1:L1', {
+        'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
+        'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18},
+    })
+    ws_orders.freeze(rows=1, cols=2)
+    existing_srids = set()
+    print("  Лист 'orders' создан")
 
-    if not existing:
-        ws.append_row(HEADERS_ROW)
-        print("  Заголовок добавлен")
+print(f"  Период загрузки: с {ORDERS_DATE_FROM}")
+result = wb_get(f'{STATS_URL}/api/v1/supplier/orders', params={
+    'dateFrom': ORDERS_DATE_FROM + 'T00:00:00',
+    'flag': 0
+})
+
+all_orders = []
+if result:
+    all_orders = result if isinstance(result, list) else result.get('orders', [])
+    print(f"  Получено заказов из API: {len(all_orders)}")
+
+new_orders = []
+for order in all_orders:
+    srid = str(order.get('srid', '') or order.get('odid', ''))
+    if srid not in existing_srids:
+        date = str(order.get('date', '') or order.get('dateCreated', ''))[:10]
+        vendor = order.get('supplierArticle', '')
+        nm_id = order.get('nmId', '')
+        name = order.get('subject', '')
+        category = order.get('category', '')
+        brand = order.get('brand', '')
+        price = order.get('totalPrice', 0) or 0
+        price_disc = order.get('priceWithDisc', 0) or 0
+        warehouse = order.get('warehouseName', '')
+        region = order.get('regionName', '') or order.get('oblast', '')
+        is_cancel = order.get('isCancel', False)
+        cancel_dt = order.get('cancelDt', '')
+        status = 'Отменён' if is_cancel or cancel_dt else 'Активен'
+        new_orders.append([date, vendor, name, category, brand,
+                           price, price_disc, warehouse, region,
+                           status, srid, nm_id])
+
+print(f"  Новых заказов: {len(new_orders)}")
+
+if new_orders:
+    new_orders.sort(key=lambda x: x[0])
+    batch_size = 2000
+    for i in range(0, len(new_orders), batch_size):
+        batch = new_orders[i:i+batch_size]
+        ws_orders.append_rows(batch, value_input_option='USER_ENTERED')
+        print(f"  Записано строк {i+1}–{i+len(batch)}")
+        time.sleep(1)
+    print(f"✅ Заказы: добавлено {len(new_orders)} новых записей")
+else:
+    print("✅ Заказы: новых нет")
+
+
+# ================================================================
+# 2. ЦЕНЫ
+# ================================================================
+print("\n→ Шаг 2: Снимаем текущие цены...")
+
+PRICES_HEADERS = ['Дата', 'Артикул поставщика', 'nmID',
+                  'Цена до скидки, ₽', 'Скидка, %', 'Цена после скидки, ₽']
+
+try:
+    ws_prices = sh.worksheet('prices')
+    existing_prices = ws_prices.get_all_values()
+    if not existing_prices:
+        ws_prices.append_row(PRICES_HEADERS)
         existing_dates = set()
     else:
-        existing_dates = set(row[0] for row in existing[1:] if row)
-
+        existing_dates = set(row[0] for row in existing_prices[1:] if row)
     print(f"  Дат в истории: {len(existing_dates)}")
-
 except Exception:
-    ws = sh.add_worksheet(title='stocks_history', rows=200000, cols=8)
-    ws.append_row(HEADERS_ROW)
+    ws_prices = sh.add_worksheet(title='prices', rows=100000, cols=6)
+    ws_prices.append_row(PRICES_HEADERS)
+    ws_prices.format('A1:F1', {
+        'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
+        'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18},
+    })
+    ws_prices.freeze(rows=1, cols=2)
     existing_dates = set()
-    print("  Лист 'stocks_history' создан")
+    print("  Лист 'prices' создан")
 
 if TODAY in existing_dates:
-    print(f"⚠️  Остатки за {TODAY} уже записаны — пропускаем запись stocks_history")
-    skip_stocks_write = True
+    print(f"⚠️  Цены за {TODAY} уже записаны — пропускаем")
 else:
-    skip_stocks_write = False
+    all_goods = []
+    limit = 1000
+    offset = 0
+    while True:
+        result = wb_get(f'{PRICES_URL}/api/v2/list/goods/filter', params={
+            'limit': limit, 'offset': offset,
+        })
+        if not result:
+            break
+        goods = result.get('data', {}).get('listGoods', [])
+        if not goods:
+            break
+        all_goods.extend(goods)
+        print(f"  offset={offset}: получено {len(goods)}, всего: {len(all_goods)}")
+        if len(goods) < limit:
+            break
+        offset += limit
+        time.sleep(0.5)
 
-# ── 5а. Перезаписываем справочник nomenclature (артикул -> название) ──
-# Отдельный маленький лист, чтобы Apps Script мог брать оттуда названия
-# для 'Динамика', не перелопачивая всю (растущую) историю stocks_history.
-print("\n→ Шаг 5а: Обновляем справочник 'nomenclature'...")
+    print(f"  Итого артикулов: {len(all_goods)}")
 
-NOM_HEADERS = ['Артикул поставщика', 'nmID', 'Название']
-nom_rows = []
-for nm_id, (article, name) in nm_to_article.items():
-    if article:
-        nom_rows.append([article, nm_id, name])
-nom_rows.sort(key=lambda x: x[0])
+    if all_goods:
+        price_rows = []
+        for item in all_goods:
+            nm_id = item.get('nmID', '')
+            vendor_code = item.get('vendorCode', '')
+            sizes = item.get('sizes', [])
+            price = sizes[0].get('price', 0) if sizes else item.get('price', 0)
+            discount = item.get('discount', 0) or 0
+            price_after = round((price or 0) * (1 - discount / 100), 2)
+            price_rows.append([TODAY, vendor_code, nm_id, round(price or 0, 2), discount, price_after])
 
-try:
-    nom_ws = sh.worksheet('nomenclature')
-    nom_ws.clear()
-except Exception:
-    nom_ws = sh.add_worksheet(title='nomenclature', rows=len(nom_rows) + 10, cols=3)
+        batch_size = 2000
+        for i in range(0, len(price_rows), batch_size):
+            batch = price_rows[i:i+batch_size]
+            ws_prices.append_rows(batch, value_input_option='USER_ENTERED')
+            print(f"  Записано строк {i+1}–{i+len(batch)}")
+            time.sleep(1)
+        print(f"✅ Цены: записано {len(price_rows)} артикулов")
+    else:
+        print("❌ Цены не получены")
 
-nom_ws.update('A1', [NOM_HEADERS] + nom_rows, value_input_option='USER_ENTERED')
-nom_ws.format('A1:C1', {
-    'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
-    'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18},
-})
-nom_ws.freeze(rows=1)
-print(f"  Записано в 'nomenclature': {len(nom_rows)} артикулов")
-
-# Кэш баркодов — только если сегодня реально получили их с Content API
-# (если работали по кэшу из-за 403/ошибки — не перезаписываем удачный кэш пустотой/старым).
-if not content_api_failed:
-    BC_HEADERS = ['Баркод', 'nmID']
-    bc_rows = [[bc, nm] for bc, nm in barcode_to_nm.items()]
-    try:
-        bc_ws = sh.worksheet('barcodes')
-        bc_ws.clear()
-    except Exception:
-        bc_ws = sh.add_worksheet(title='barcodes', rows=len(bc_rows) + 10, cols=2)
-    bc_ws.update('A1', [BC_HEADERS] + bc_rows, value_input_option='USER_ENTERED')
-    bc_ws.format('A1:B1', {
-        'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
-        'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18},
-    })
-    bc_ws.freeze(rows=1)
-    print(f"  Записано в 'barcodes' (кэш на случай будущих сбоев Content API): {len(bc_rows)} баркодов")
-else:
-    print("  Кэш 'barcodes' не трогаем — сегодня работали по старому кэшу, нечего обновлять")
-
-if skip_stocks_write:
-    exit(0)
-
-batch_size = 2000
-for i in range(0, len(rows), batch_size):
-    batch = rows[i:i + batch_size]
-    ws.append_rows(batch, value_input_option='USER_ENTERED')
-    print(f"  Записано строк {i+1}–{i+len(batch)}")
-    time.sleep(1)
-
-if not existing_dates:
-    ws.format('A1:H1', {
-        'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
-        'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18},
-    })
-    ws.freeze(rows=1, cols=2)
-
-print(f"\n✅ Готово!")
-print(f"   Дата: {TODAY}")
-print(f"   Строк остатков: {len(rows)}")
-print(f"   Всего дней в истории: {len(existing_dates) + 1}")
+print(f"\n✅ Магазин {STORE_NAME} обновлён!")
