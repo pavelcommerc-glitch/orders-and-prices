@@ -115,6 +115,7 @@ print("\n→ Шаг 1: Выкачиваем актуальный список к
 
 nm_to_article = {}
 barcode_to_nm = {}  # для сопоставления остатков ФБС (по баркоду) обратно к артикулу
+content_api_failed = False
 cursor = {"limit": 100}
 page = 0
 while True:
@@ -122,8 +123,11 @@ while True:
     body = {"settings": {"cursor": cursor, "filter": {"withPhoto": -1}}}
     resp = wb_post(f'{CONTENT_URL}/content/v2/get/cards/list', body)
     if not resp:
-        print(f"❌ Не удалось получить список карточек (страница {page}) — выходим")
-        exit(1)
+        print(f"⚠️  Не удалось получить список карточек (страница {page}) — "
+              f"пробуем взять справочник из кэша (листы 'nomenclature'/'barcodes' "
+              f"с прошлого удачного запуска), не останавливаемся.")
+        content_api_failed = True
+        break
 
     cards = resp.get('cards', [])
     for c in cards:
@@ -148,6 +152,36 @@ while True:
         "nmID": next_cursor.get('nmID'),
     }
     time.sleep(0.3)
+
+if content_api_failed:
+    # Пробуем восстановить справочник из кэш-листов, записанных прошлым удачным запуском.
+    try:
+        nom_ws_cache = sh.worksheet('nomenclature')
+        nom_data = nom_ws_cache.get_all_values()[1:]  # без заголовка
+        for row in nom_data:
+            if len(row) >= 3 and row[1]:
+                article, nm_id, name = row[0], row[1], row[2]
+                nm_to_article[nm_id] = (article, name)
+        print(f"  Из кэша 'nomenclature' восстановлено: {len(nm_to_article)} карточек")
+    except Exception as e:
+        print(f"  ⚠️ Не удалось прочитать кэш 'nomenclature': {e}")
+
+    try:
+        bc_ws_cache = sh.worksheet('barcodes')
+        bc_data = bc_ws_cache.get_all_values()[1:]
+        for row in bc_data:
+            if len(row) >= 2 and row[0]:
+                barcode_to_nm[row[0]] = row[1]
+        print(f"  Из кэша 'barcodes' восстановлено: {len(barcode_to_nm)} баркодов")
+    except Exception as e:
+        print(f"  ⚠️ Не удалось прочитать кэш 'barcodes' (возможно, его ещё не было "
+              f"на прошлых запусках) — блок ФБС может отработать не полностью: {e}")
+
+    if not nm_to_article:
+        print("❌ Ни живых данных, ни кэша нет — выходим совсем")
+        exit(1)
+    print(f"  ⚠️ РАБОТАЕМ ПО КЭШУ (не сегодняшний список карточек) — "
+          f"новые/удалённые товары после последнего удачного запуска Content API не учтены.")
 
 print(f"  Всего карточек в справочнике: {len(nm_to_article)}")
 
@@ -313,6 +347,26 @@ nom_ws.format('A1:C1', {
 })
 nom_ws.freeze(rows=1)
 print(f"  Записано в 'nomenclature': {len(nom_rows)} артикулов")
+
+# Кэш баркодов — только если сегодня реально получили их с Content API
+# (если работали по кэшу из-за 403/ошибки — не перезаписываем удачный кэш пустотой/старым).
+if not content_api_failed:
+    BC_HEADERS = ['Баркод', 'nmID']
+    bc_rows = [[bc, nm] for bc, nm in barcode_to_nm.items()]
+    try:
+        bc_ws = sh.worksheet('barcodes')
+        bc_ws.clear()
+    except Exception:
+        bc_ws = sh.add_worksheet(title='barcodes', rows=len(bc_rows) + 10, cols=2)
+    bc_ws.update('A1', [BC_HEADERS] + bc_rows, value_input_option='USER_ENTERED')
+    bc_ws.format('A1:B1', {
+        'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
+        'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18},
+    })
+    bc_ws.freeze(rows=1)
+    print(f"  Записано в 'barcodes' (кэш на случай будущих сбоев Content API): {len(bc_rows)} баркодов")
+else:
+    print("  Кэш 'barcodes' не трогаем — сегодня работали по старому кэшу, нечего обновлять")
 
 if skip_stocks_write:
     exit(0)
