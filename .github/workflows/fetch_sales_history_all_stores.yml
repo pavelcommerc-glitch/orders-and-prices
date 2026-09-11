@@ -1,0 +1,32 @@
+name: Fetch Sales History (все магазины)
+on:
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: 'dateFrom (YYYY-MM-DD) — для бэкафилла. Пусто = 3 дня назад (для обычного крона)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 4 * * *'   # после stocks (03:00) и ads (03:30)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [MOTORKRAFT, B, F, G, R, T, Z]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - run: pip install gspread google-auth requests
+      - name: Run for ${{ matrix.store }}
+        run: python fetch_sales_history.py
+        env:
+          WB_TOKEN: ${{ matrix.store == 'MOTORKRAFT' && secrets.WB_TOKEN || secrets[format('WB_TOKEN_{0}', matrix.store)] }}
+          SPREADSHEET_ID: ${{ matrix.store == 'MOTORKRAFT' && secrets.SPREADSHEET_ID || secrets[format('SPREADSHEET_ID_{0}', matrix.store)] }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SALES_DATE_FROM: ${{ github.event.inputs.date_from }}
