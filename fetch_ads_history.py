@@ -12,6 +12,15 @@ fetch_stocks_history.py, только источник — WB Promotion (Adverti
 не чаще 1 раза в 20 секунд (burst 1). Поэтому кампании собираются пачками по
 50 (максимум за раз), и между пачками скрипт специально ждёт.
 
+ДИАПАЗОН ДАТ: метод отдаёт статистику по дням сразу за период до 31 дня в
+ОДНОМ запросе (не нужно дёргать API по одному дню). По умолчанию скрипт
+берёт только сегодня (для ежедневного крона). Для разового бэкафилла задай
+переменные окружения ADS_DATE_FROM / ADS_DATE_TO:
+
+  export ADS_DATE_FROM='2026-08-11'
+  export ADS_DATE_TO='2026-08-24'
+  python fetch_ads_history.py
+
 nmId -> артикул сопоставляется через те же кэш-листы 'nomenclature'/'barcodes',
 что пишет fetch_stocks_history.py — этот скрипт их только ЧИТАЕТ, не трогает.
 Так что fetch_stocks_history.py должен был отработать хотя бы раз раньше.
@@ -43,7 +52,7 @@ import time
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timedelta
 
 WB_TOKEN = os.environ['WB_TOKEN']
 HEADERS = {'Authorization': WB_TOKEN, 'Content-Type': 'application/json'}
@@ -59,7 +68,16 @@ gc = gspread.authorize(creds)
 sh = gc.open_by_key(os.environ['SPREADSHEET_ID'])
 
 TODAY = datetime.now().strftime('%Y-%m-%d')
-print(f"Дата снятия рекламной статистики: {TODAY}")
+DATE_FROM = os.environ.get('ADS_DATE_FROM', TODAY)
+DATE_TO = os.environ.get('ADS_DATE_TO', TODAY)
+print(f"Период снятия рекламной статистики: {DATE_FROM} — {DATE_TO}")
+
+# WB fullstats: максимум 31 день за один запрос — проверим и подскажем, если превысили
+_days_span = (datetime.strptime(DATE_TO, '%Y-%m-%d') - datetime.strptime(DATE_FROM, '%Y-%m-%d')).days + 1
+if _days_span > 31:
+    print(f"❌ Период {_days_span} дней — больше лимита WB (31 день за раз). "
+          f"Разбей на несколько запусков с разными ADS_DATE_FROM/ADS_DATE_TO.")
+    exit(1)
 
 
 def wb_get(url, params=None, retries=5):
@@ -128,8 +146,8 @@ print("\n→ Шаг 2: Получаем статистику (fullstats)...")
 BATCH_SIZE = 50
 SLEEP_BETWEEN_BATCHES = 22  # секунд — лимит 3 запроса/мин, интервал не чаще раза в 20с
 
-# nm_id (str) -> агрегированные показатели за TODAY
-agg = {}  # nm_id -> {views, clicks, orders, sum, sum_price}
+# (дата, nm_id) -> агрегированные показатели за эту дату
+agg = {}
 
 batches = [all_advert_ids[i:i + BATCH_SIZE] for i in range(0, len(all_advert_ids), BATCH_SIZE)]
 for bi, batch in enumerate(batches):
@@ -137,24 +155,29 @@ for bi, batch in enumerate(batches):
     print(f"  Пачка {bi+1}/{len(batches)}: {len(batch)} кампаний")
     resp = wb_get(f'{ADVERT_URL}/adv/v3/fullstats', params={
         'ids': ids_param,
-        'beginDate': TODAY,
-        'endDate': TODAY,
+        'beginDate': DATE_FROM,
+        'endDate': DATE_TO,
     })
     if resp:
         for campaign in resp:
             for day in campaign.get('days', []):
+                # day['date'] приходит как "2026-08-24T00:00:00Z" — берём только дату
+                day_date = str(day.get('date', ''))[:10]
+                if not day_date:
+                    continue
                 for app in day.get('apps', []):
                     for nm in app.get('nms', []):
                         nm_id = str(nm.get('nmId', ''))
                         if not nm_id:
                             continue
-                        if nm_id not in agg:
-                            agg[nm_id] = {'views': 0, 'clicks': 0, 'orders': 0, 'sum': 0.0, 'sum_price': 0.0}
-                        agg[nm_id]['views'] += nm.get('views', 0) or 0
-                        agg[nm_id]['clicks'] += nm.get('clicks', 0) or 0
-                        agg[nm_id]['orders'] += nm.get('orders', 0) or 0
-                        agg[nm_id]['sum'] += nm.get('sum', 0) or 0
-                        agg[nm_id]['sum_price'] += nm.get('sum_price', 0) or 0
+                        key = (day_date, nm_id)
+                        if key not in agg:
+                            agg[key] = {'views': 0, 'clicks': 0, 'orders': 0, 'sum': 0.0, 'sum_price': 0.0}
+                        agg[key]['views'] += nm.get('views', 0) or 0
+                        agg[key]['clicks'] += nm.get('clicks', 0) or 0
+                        agg[key]['orders'] += nm.get('orders', 0) or 0
+                        agg[key]['sum'] += nm.get('sum', 0) or 0
+                        agg[key]['sum_price'] += nm.get('sum_price', 0) or 0
     else:
         print(f"    ⚠️ Пачка {bi+1} не отдала данные (см. ошибку выше)")
 
@@ -162,21 +185,23 @@ for bi, batch in enumerate(batches):
         print(f"    ждём {SLEEP_BETWEEN_BATCHES}с (лимит API)...")
         time.sleep(SLEEP_BETWEEN_BATCHES)
 
-print(f"  Артикулов с рекламной статистикой за {TODAY}: {len(agg)}")
+dates_covered = sorted(set(k[0] for k in agg.keys()))
+print(f"  Дат с данными: {len(dates_covered)} ({dates_covered[:3]}{'...' if len(dates_covered) > 3 else ''})")
+print(f"  Всего пар (дата, артикул): {len(agg)}")
 
 # ── 3. Формируем строки ───────────────────────────────────────────
 print("\n→ Шаг 3: Формируем строки...")
 
 rows = []
 unmatched = set()
-for nm_id, m in agg.items():
+for (day_date, nm_id), m in agg.items():
     article, name = nm_to_article.get(nm_id, ('', ''))
     if not article:
         unmatched.add(nm_id)
     ctr = round(m['clicks'] / m['views'] * 100, 2) if m['views'] else 0
     cpc = round(m['sum'] / m['clicks'], 2) if m['clicks'] else 0
     rows.append([
-        TODAY, article, nm_id, name,
+        day_date, article, nm_id, name,
         m['views'], m['clicks'], ctr, cpc,
         m['orders'], round(m['sum_price'], 2), round(m['sum'], 2),
     ])
@@ -208,13 +233,20 @@ except Exception:
     existing_dates = set()
     print("  Лист 'ads_history' создан")
 
-if TODAY in existing_dates:
-    print(f"⚠️  Реклама за {TODAY} уже записана — пропускаем")
+# фильтруем только те строки, чья дата ещё не записана (не всё разом, как раньше,
+# а по датам — при бэкафилле часть диапазона могла уже быть записана раньше)
+rows_to_write = [r for r in rows if r[0] not in existing_dates]
+skipped = len(rows) - len(rows_to_write)
+if skipped:
+    print(f"  Пропущено (даты уже есть в истории): {skipped} строк")
+
+if not rows_to_write:
+    print("⚠️  Всё уже записано — новых строк нет")
     exit(0)
 
 batch_size = 2000
-for i in range(0, len(rows), batch_size):
-    batch = rows[i:i + batch_size]
+for i in range(0, len(rows_to_write), batch_size):
+    batch = rows_to_write[i:i + batch_size]
     ws.append_rows(batch, value_input_option='USER_ENTERED')
     print(f"  Записано строк {i+1}–{i+len(batch)}")
     time.sleep(1)
@@ -227,5 +259,5 @@ if not existing_dates:
     ws.freeze(rows=1, cols=2)
 
 print(f"\n✅ Готово!")
-print(f"   Дата: {TODAY}")
-print(f"   Строк рекламной статистики: {len(rows)}")
+print(f"   Период: {DATE_FROM} — {DATE_TO}")
+print(f"   Строк записано: {len(rows_to_write)}")
