@@ -1,8 +1,17 @@
 name: Fetch Ads History (все магазины)
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: 'Дата от (YYYY-MM-DD) — оставь пустым для "сегодня"'
+        required: false
+        default: ''
+      date_to:
+        description: 'Дата до (YYYY-MM-DD) — оставь пустым для "сегодня"'
+        required: false
+        default: ''
   schedule:
-    - cron: '30 3 * * *'   # запускать после fetch_stocks_history (тому нужен свежий nomenclature)
+    - cron: '30 3 * * *'   # ежедневный автозапуск — без дат, всегда "сегодня"
 
 jobs:
   run:
@@ -24,3 +33,5 @@ jobs:
           WB_TOKEN: ${{ matrix.store == 'MOTORKRAFT' && secrets.WB_TOKEN || secrets[format('WB_TOKEN_{0}', matrix.store)] }}
           SPREADSHEET_ID: ${{ matrix.store == 'MOTORKRAFT' && secrets.SPREADSHEET_ID || secrets[format('SPREADSHEET_ID_{0}', matrix.store)] }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          ADS_DATE_FROM: ${{ github.event.inputs.date_from }}
+          ADS_DATE_TO: ${{ github.event.inputs.date_to }}
