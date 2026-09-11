@@ -1,0 +1,26 @@
+name: Fetch Ads History (все магазины)
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '30 3 * * *'   # запускать после fetch_stocks_history (тому нужен свежий nomenclature)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [MOTORKRAFT, B, F, G, R, T, Z]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - run: pip install gspread google-auth requests
+      - name: Run for ${{ matrix.store }}
+        run: python fetch_ads_history.py
+        env:
+          WB_TOKEN: ${{ matrix.store == 'MOTORKRAFT' && secrets.WB_TOKEN || secrets[format('WB_TOKEN_{0}', matrix.store)] }}
+          SPREADSHEET_ID: ${{ matrix.store == 'MOTORKRAFT' && secrets.SPREADSHEET_ID || secrets[format('SPREADSHEET_ID_{0}', matrix.store)] }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
