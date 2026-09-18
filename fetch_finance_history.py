@@ -219,7 +219,7 @@ except Exception:
 
 if ws is None or ws.acell('A1').value is None:
     if ws is None:
-        ws = sh.add_worksheet(title='finance', rows=200000, cols=len(FINANCE_HEADERS))
+        ws = sh.add_worksheet(title='finance', rows=100, cols=len(FINANCE_HEADERS))
     ws.append_row(FINANCE_HEADERS)
     max_rrd_id = 0
     date_from = FIRST_RUN_DATE_FROM
