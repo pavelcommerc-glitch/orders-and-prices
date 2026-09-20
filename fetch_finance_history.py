@@ -1,16 +1,23 @@
 """
 Тянет детализированный отчёт о реализации (полная финансовая разбивка —
 комиссии, логистика, хранение, штрафы, удержания и т.д.) и дописывает
-в лист 'finance'. Список только РАСТЁТ, ничего не перезаписываем.
+в лист 'finance'. Аналог stocks_history/sales_history по духу: список
+только РАСТЁТ, ничего не перезаписываем.
 
 Используется:
   GET https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod
   Категория токена: Statistics (та же, что уже используется для orders/sales)
 
-КЛЮЧЕВАЯ ИДЕЯ: этот метод устроен как курсор-пагинация по rrd_id (уникальный,
-монотонно растущий ID строки отчёта) — "все записи ПОСЛЕ этого rrd_id".
-Берём МАКСИМАЛЬНЫЙ rrd_id, что уже есть в листе 'finance', и продолжаем
-пагинацию с него — не нужно перечитывать всё заново.
+КЛЮЧЕВАЯ ИДЕЯ (в отличие от старой версии в другом репозитории): этот метод
+устроен как курсор-пагинация по rrd_id (уникальный, монотонно растущий ID
+строки отчёта) — НЕ "все записи, что изменились с даты", а "все записи ПОСЛЕ
+этого rrd_id". Строки в этом отчёте никогда не меняются задним числом — это
+чистый append-only лог. Поэтому: 1) не нужно ничего обновлять/перезаписывать,
+только дописывать; 2) не нужно самому хранить состояние отдельно — просто
+берём МАКСИМАЛЬНЫЙ rrd_id, что уже есть в листе 'finance', и продолжаем
+пагинацию с него. Старая версия каждый день заново перечитывала ВЕСЬ период
+с 1 мая и полностью перезаписывала лист — вот это и стало неподъёмным по
+мере роста истории.
 
 Запуск:
   export WB_TOKEN='...'              (токен с категорией Statistics)
@@ -46,28 +53,10 @@ creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(os.environ['SPREADSHEET_ID'])
 
+# Точка отсчёта ТОЛЬКО для самого первого запуска (пустой лист) — дальше
+# продолжаем от максимального rrd_id, уже сохранённого в листе.
 FIRST_RUN_DATE_FROM = os.environ.get('FINANCE_DATE_FROM', '').strip() or '2026-05-01'
 DATE_TO = (datetime.now() - timedelta(days=0)).strftime('%Y-%m-%d')
-
-
-def wb_get(url, params=None, retries=5):
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, headers=HEADERS, params=params, timeout=60)
-            if r.status_code == 429:
-                wait = 60 * (attempt + 1)
-                print(f"  ⏳ 429 — жду {wait}с (попытка {attempt+1}/{retries})...")
-                time.sleep(wait)
-                continue
-            if r.status_code == 200:
-                return r.json()
-            print(f"  Ошибка {r.status_code}: {r.text[:300]}")
-            return None
-        except Exception as e:
-            print(f"  Исключение: {e}")
-            time.sleep(10)
-    return None
-
 
 FINANCE_HEADERS = [
     "rrd_id", "Номер поставки", "Предмет", "Код номенклатуры", "Бренд", "Артикул поставщика",
@@ -112,6 +101,25 @@ FINANCE_HEADERS = [
     "Скидка за промокод, %", "Id подменного артикула",
     "Скидка по подменному артикулу, %", "Оптовая скидка для бизнеса, %",
 ]
+
+
+def wb_get(url, params=None, retries=5):
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, headers=HEADERS, params=params, timeout=60)
+            if r.status_code == 429:
+                wait = 60 * (attempt + 1)
+                print(f"  ⏳ 429 — жду {wait}с (попытка {attempt+1}/{retries})...")
+                time.sleep(wait)
+                continue
+            if r.status_code == 200:
+                return r.json()
+            print(f"  Ошибка {r.status_code}: {r.text[:300]}")
+            return None
+        except Exception as e:
+            print(f"  Исключение: {e}")
+            time.sleep(10)
+    return None
 
 
 def row_from_item(item):
@@ -217,10 +225,11 @@ if ws is None or ws.acell('A1').value is None:
     date_from = FIRST_RUN_DATE_FROM
     print(f"  Лист новый/пустой — первый запуск, период с {date_from}")
 else:
-    col_a = ws.col_values(1)[1:]
+    # Берём только колонку A (rrd_id) — не тащим весь лист целиком
+    col_a = ws.col_values(1)[1:]  # без заголовка
     ids = [int(v) for v in col_a if str(v).strip().isdigit()]
     max_rrd_id = max(ids) if ids else 0
-    date_from = FIRST_RUN_DATE_FROM
+    date_from = FIRST_RUN_DATE_FROM  # WB всё равно требует dateFrom/dateTo, но rrdid решает, что реально новое
     print(f"  Уже есть {len(ids)} строк, последний rrd_id: {max_rrd_id} — продолжаем с него")
 
 # ── 2. Пагинация по rrd_id ─────────────────────────────────────────
