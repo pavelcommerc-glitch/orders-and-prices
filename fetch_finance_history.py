@@ -260,6 +260,16 @@ while True:
         if rid is None or rid <= max_rrd_id or rid in seen_ids:
             continue
         seen_ids.add(rid)
+
+        # ДИАГНОСТИКА (один раз): печатаем сырой JSON первой строки с
+        # обоснованием "Продажа" — чтобы найти реальное имя поля для
+        # эквайринга, раз "acquiring_bank_commission" почему-то всегда 0.
+        if item.get('supplier_oper_name') == 'Продажа' and not globals().get('_diag_printed'):
+            print("\n  🔎 ДИАГНОСТИКА — сырой JSON первой строки 'Продажа' (пришли мне этот вывод):")
+            print("  " + json.dumps(item, ensure_ascii=False, indent=2)[:3000])
+            print()
+            globals()['_diag_printed'] = True
+
         new_rows.append(row_from_item(item))
         new_in_batch += 1
         if rid > batch_max_rrd:
