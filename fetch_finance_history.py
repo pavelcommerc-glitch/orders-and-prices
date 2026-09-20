@@ -1,26 +1,16 @@
 """
 Тянет детализированный отчёт о реализации (полная финансовая разбивка —
-комиссии, логистика, хранение, штрафы, удержания и т.д.) в лист 'finance'.
+комиссии, логистика, хранение, штрафы, удержания и т.д.) и дописывает
+в лист 'finance'. Список только РАСТЁТ, ничего не перезаписываем.
 
 Используется:
   GET https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod
   Категория токена: Statistics (та же, что уже используется для orders/sales)
 
-ВАЖНО (обновлено): отчёт о реализации у WB НЕ финальный сразу после публикации —
-WB ещё 1-2 недели дозаполняет и правит его задним числом (штрафы, возвраты
-и т.д. могут появиться/измениться уже ПОСЛЕ того, как мы его забрали).
-Поэтому чистый append-only (только дописывать новые rrd_id) со временем
-расходится с кабинетом. Логика теперь такая:
-
-  - Всё, что СТАРШЕ 14 дней — считаем окончательным, не трогаем (как раньше).
-  - Последние 14 дней — при КАЖДОМ запуске выбрасываем то, что уже было
-    записано за этот период, и выкачиваем этот кусок ЗАНОВО целиком.
-    Не самый экономный вариант по объёму запроса, зато данные в этом
-    "свежем" окне не расходятся с тем, что реально показывает WB.
-
-Лимит на этот метод у WB — примерно 1 запрос в минуту, общий на все методы
-статистики (orders/sales/этот) для одного токена аккаунта — не гоняй этот
-скрипт впритык по времени к fetch_sales_history.py на одном токене.
+КЛЮЧЕВАЯ ИДЕЯ: этот метод устроен как курсор-пагинация по rrd_id (уникальный,
+монотонно растущий ID строки отчёта) — "все записи ПОСЛЕ этого rrd_id".
+Берём МАКСИМАЛЬНЫЙ rrd_id, что уже есть в листе 'finance', и продолжаем
+пагинацию с него — не нужно перечитывать всё заново.
 
 Запуск:
   export WB_TOKEN='...'              (токен с категорией Statistics)
@@ -32,7 +22,7 @@ WB ещё 1-2 недели дозаполняет и правит его зад�
 Для самого первого запуска (когда листа 'finance' ещё нет или он пуст) —
 период отчёта начинается с FINANCE_DATE_FROM (по умолчанию 2026-05-01,
 можно переопределить переменной окружения). На всех следующих запусках
-эта дата уже не важна — работает только 14-дневное окно перезаписи.
+эта дата уже не важна — пагинация идёт от последнего rrd_id в самом листе.
 """
 
 import os
@@ -56,10 +46,28 @@ creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(os.environ['SPREADSHEET_ID'])
 
-# Точка отсчёта ТОЛЬКО для самого первого запуска (пустой лист) — дальше
-# продолжаем от максимального rrd_id, уже сохранённого в листе.
 FIRST_RUN_DATE_FROM = os.environ.get('FINANCE_DATE_FROM', '').strip() or '2026-05-01'
 DATE_TO = (datetime.now() - timedelta(days=0)).strftime('%Y-%m-%d')
+
+
+def wb_get(url, params=None, retries=5):
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, headers=HEADERS, params=params, timeout=60)
+            if r.status_code == 429:
+                wait = 60 * (attempt + 1)
+                print(f"  ⏳ 429 — жду {wait}с (попытка {attempt+1}/{retries})...")
+                time.sleep(wait)
+                continue
+            if r.status_code == 200:
+                return r.json()
+            print(f"  Ошибка {r.status_code}: {r.text[:300]}")
+            return None
+        except Exception as e:
+            print(f"  Исключение: {e}")
+            time.sleep(10)
+    return None
+
 
 FINANCE_HEADERS = [
     "rrd_id", "Номер поставки", "Предмет", "Код номенклатуры", "Бренд", "Артикул поставщика",
@@ -104,25 +112,6 @@ FINANCE_HEADERS = [
     "Скидка за промокод, %", "Id подменного артикула",
     "Скидка по подменному артикулу, %", "Оптовая скидка для бизнеса, %",
 ]
-
-
-def wb_get(url, params=None, retries=5):
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, headers=HEADERS, params=params, timeout=60)
-            if r.status_code == 429:
-                wait = 60 * (attempt + 1)
-                print(f"  ⏳ 429 — жду {wait}с (попытка {attempt+1}/{retries})...")
-                time.sleep(wait)
-                continue
-            if r.status_code == 200:
-                return r.json()
-            print(f"  Ошибка {r.status_code}: {r.text[:300]}")
-            return None
-        except Exception as e:
-            print(f"  Исключение: {e}")
-            time.sleep(10)
-    return None
 
 
 def row_from_item(item):
@@ -212,48 +201,33 @@ def row_from_item(item):
     ]
 
 
-# ── 1. Лист 'finance' + разделяем на "старое" (не трогаем) и "окно
-#       последних 14 дней" (полностью перезабираем заново) ──────────
+# ── 1. Лист 'finance' + определяем, откуда продолжать ─────────────
 print("\n→ Шаг 1: Проверяем лист 'finance'...")
-
-REWRITE_WINDOW_DAYS = 14
-rewrite_cutoff = (datetime.now() - timedelta(days=REWRITE_WINDOW_DAYS)).strftime('%Y-%m-%d')
-print(f"  Окно перезаписи: последние {REWRITE_WINDOW_DAYS} дней (с {rewrite_cutoff}) — "
-      f"WB дозаполняет/правит отчёт о реализации ещё 1-2 недели после публикации, "
-      f"поэтому эти строки каждый раз выкачиваем заново, а не просто дописываем.")
 
 try:
     ws = sh.worksheet('finance')
 except Exception:
     ws = None
 
-is_first_run = ws is None or ws.acell('A1').value is None
-
-if is_first_run:
+if ws is None or ws.acell('A1').value is None:
     if ws is None:
         ws = sh.add_worksheet(title='finance', rows=100, cols=len(FINANCE_HEADERS))
     ws.append_row(FINANCE_HEADERS)
-    keep_rows = []
+    max_rrd_id = 0
     date_from = FIRST_RUN_DATE_FROM
-    print(f"  Лист новый/пустой — первый запуск, период с {date_from} (весь сразу, окна перезаписи ещё нет)")
+    print(f"  Лист новый/пустой — первый запуск, период с {date_from}")
 else:
-    all_values = ws.get_all_values()
-    existing_headers = all_values[0]
-    data_rows = all_values[1:]
-    # индекс колонки "Дата продажи" — по названию заголовка, не по позиции,
-    # на случай если порядок колонок когда-то изменится
-    sale_date_idx = existing_headers.index('Дата продажи') if 'Дата продажи' in existing_headers else 12
+    col_a = ws.col_values(1)[1:]
+    ids = [int(v) for v in col_a if str(v).strip().isdigit()]
+    max_rrd_id = max(ids) if ids else 0
+    date_from = FIRST_RUN_DATE_FROM
+    print(f"  Уже есть {len(ids)} строк, последний rrd_id: {max_rrd_id} — продолжаем с него")
 
-    keep_rows = [r for r in data_rows if len(r) > sale_date_idx and r[sale_date_idx] < rewrite_cutoff]
-    dropped = len(data_rows) - len(keep_rows)
-    print(f"  Было строк: {len(data_rows)}. Оставляем (дата продажи < {rewrite_cutoff}): {len(keep_rows)}. "
-          f"Убираем на переперезабор (дата продажи >= {rewrite_cutoff}): {dropped}")
-    date_from = rewrite_cutoff  # забираем окно заново с нуля, rrd_id тут не помогает — нужен полный охват дат
+# ── 2. Пагинация по rrd_id ─────────────────────────────────────────
+print(f"\n→ Шаг 2: Забираем новые строки (dateFrom={date_from}, dateTo={DATE_TO})...")
 
-print(f"\n→ Шаг 2: Забираем строки за окно (dateFrom={date_from}, dateTo={DATE_TO})...")
-
-all_fetched_rows = []
-rrdid = 0
+new_rows = []
+rrdid = max_rrd_id
 seen_ids = set()
 
 while True:
@@ -267,58 +241,41 @@ while True:
         print("❌ Нет ответа от API — прерываем на том, что уже собрали")
         break
     if not data:
-        print("  Строк больше нет")
+        print("  Новых строк больше нет")
         break
 
     new_in_batch = 0
     batch_max_rrd = rrdid
     for item in data:
         rid = item.get('rrd_id')
-        if rid is None or rid in seen_ids:
+        if rid is None or rid <= max_rrd_id or rid in seen_ids:
             continue
         seen_ids.add(rid)
-
-        # ДИАГНОСТИКА (один раз): печатаем сырой JSON первой строки с
-        # обоснованием "Продажа" — чтобы найти реальное имя поля для
-        # эквайринга, раз "acquiring_bank_commission" почему-то всегда 0.
-        if item.get('supplier_oper_name') == 'Продажа' and not globals().get('_diag_printed'):
-            print("\n  🔎 ДИАГНОСТИКА — сырой JSON первой строки 'Продажа' (пришли мне этот вывод):")
-            print("  " + json.dumps(item, ensure_ascii=False, indent=2)[:3000])
-            print()
-            globals()['_diag_printed'] = True
-
-        all_fetched_rows.append(row_from_item(item))
+        new_rows.append(row_from_item(item))
         new_in_batch += 1
         if rid > batch_max_rrd:
             batch_max_rrd = rid
 
-    print(f"  Получено {len(data)} строк, из них новых в этой пачке: {new_in_batch} (всего собрано: {len(all_fetched_rows)})")
+    print(f"  Получено {len(data)} строк, из них новых: {new_in_batch} (всего новых: {len(new_rows)})")
 
     if new_in_batch == 0 or len(data) < 100000:
-        break
-    if batch_max_rrd <= rrdid:
-        print("  ⚠️ Курсор не сдвинулся — останавливаемся, чтобы не зациклиться")
         break
     rrdid = batch_max_rrd
     time.sleep(2)
 
-print(f"\nИтого свежих строк за окно: {len(all_fetched_rows)}")
+print(f"\nИтого новых строк: {len(new_rows)}")
 
-# ── 3. Полная перезапись: старое (что оставили) + свежее окно ──────
-print("\n→ Шаг 3: Перезаписываем лист (старое без изменений + свежее окно)...")
+# ── 3. Дописываем (только append, никогда не переписываем старое) ──
+if not new_rows:
+    print("Нечего дописывать — всё уже актуально")
+    exit(0)
 
-if is_first_run:
-    final_rows = all_fetched_rows
-else:
-    final_rows = keep_rows + all_fetched_rows
-
-ws.clear()
-ws.append_row(FINANCE_HEADERS)
+print("\n→ Шаг 3: Дописываем в Google Sheets...")
 batch_size = 2000
-for i in range(0, len(final_rows), batch_size):
-    batch = final_rows[i:i + batch_size]
+for i in range(0, len(new_rows), batch_size):
+    batch = new_rows[i:i + batch_size]
     ws.append_rows(batch, value_input_option='USER_ENTERED')
     print(f"  Записано строк {i+1}–{i+len(batch)}")
     time.sleep(1)
 
-print(f"\n✅ Готово! Итого строк в 'finance': {len(final_rows)}")
+print(f"\n✅ Готово! Дописано {len(new_rows)} новых строк в 'finance'")
