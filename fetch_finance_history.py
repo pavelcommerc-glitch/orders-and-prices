@@ -1,38 +1,48 @@
 """
 Тянет детализированный отчёт о реализации (полная финансовая разбивка —
-комиссии, логистика, хранение, штрафы, удержания и т.д.) в лист 'finance'.
+комиссии, эквайринг, логистика, хранение, штрафы, удержания и т.д.) в лист
+'finance'.
 
-Используется:
-  GET https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod
-  Категория токена: Statistics (та же, что уже используется для orders/sales)
+ОБНОВЛЕНО: старый метод GET /api/v5/supplier/reportDetailByPeriod отключён
+Wildberries (объявлено к отключению 15 июля 2026, отключали постепенно —
+сначала жёсткие 429, затем 404). Новый метод:
 
-ВАЖНО (обновлено): отчёт о реализации у WB НЕ финальный сразу после публикации —
-WB ещё 1-2 недели дозаполняет и правит его задним числом (штрафы, возвраты
-и т.д. могут появиться/измениться уже ПОСЛЕ того, как мы его забрали).
-Поэтому чистый append-only (только дописывать новые rrd_id) со временем
-расходится с кабинетом. Логика теперь такая:
+  POST https://finance-api.wildberries.ru/api/finance/v1/sales-reports/detailed
+  Категория токена: "Финансы" (НЕ Statistics — проверь в личном кабинете WB,
+  что она включена, иначе 401/403)
 
-  - Всё, что СТАРШЕ 14 дней — считаем окончательным, не трогаем (как раньше).
+Поля в ответе теперь camelCase, суммы приходят СТРОКАМИ. В сам лист 'finance'
+пишем те же русские названия колонок, что и раньше — старые формулы в
+Apps Script ("по_артикулам", "расчет") трогать не нужно, меняется только
+здесь маппинг JSON-полей.
+
+Ключевые переименования по сравнению со старым API:
+  supplier_oper_name → sellerOperName (Обоснование для оплаты)
+  sa_name            → vendorCode     (Артикул поставщика)
+  ppvz_vw            → ppvzReward     (Вознаграждение ВВ)
+  acquiring_bank_commission → acquiringFee (Эквайринг — раньше было всегда
+                                             пусто в старом API, в новом реально
+                                             заполняется)
+  storage_fee        → paidStorage
+  acceptance         → paidAcceptance
+  rrd_id             → rrdId
+
+ВАЖНО: отчёт о реализации у WB НЕ финальный сразу после публикации — WB ещё
+1-2 недели дозаполняет и правит его задним числом. Поэтому:
+  - Всё, что СТАРШЕ 14 дней — считаем окончательным, не трогаем (append-only).
   - Последние 14 дней — при КАЖДОМ запуске выбрасываем то, что уже было
     записано за этот период, и выкачиваем этот кусок ЗАНОВО целиком.
-    Не самый экономный вариант по объёму запроса, зато данные в этом
-    "свежем" окне не расходятся с тем, что реально показывает WB.
 
-Лимит на этот метод у WB — примерно 1 запрос в минуту, общий на все методы
-статистики (orders/sales/этот) для одного токена аккаунта — не гоняй этот
-скрипт впритык по времени к fetch_sales_history.py на одном токене.
+Пагинация: по аналогии со старым методом пробуем rrdId как курсор в теле
+запроса. Если в какой-то момент WB поменяет схему пагинации — это будет
+видно по тому, что limit постоянно возвращает одно и то же (rrdId не растёт).
 
 Запуск:
-  export WB_TOKEN='...'              (токен с категорией Statistics)
+  export WB_TOKEN='...'              (токен с категорией "Финансы"!)
   export GOOGLE_CREDENTIALS='{"type":"service_account",...}'
   export SPREADSHEET_ID='...'
   pip install gspread google-auth requests
   python fetch_finance_history.py
-
-Для самого первого запуска (когда листа 'finance' ещё нет или он пуст) —
-период отчёта начинается с FINANCE_DATE_FROM (по умолчанию 2026-05-01,
-можно переопределить переменной окружения). На всех следующих запусках
-эта дата уже не важна — работает только 14-дневное окно перезаписи.
 """
 
 import os
@@ -45,7 +55,7 @@ from datetime import datetime, timedelta
 
 WB_TOKEN = os.environ['WB_TOKEN']
 HEADERS = {'Authorization': WB_TOKEN, 'Content-Type': 'application/json'}
-STATS_URL = 'https://statistics-api.wildberries.ru'
+FINANCE_URL = 'https://finance-api.wildberries.ru'
 
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -56,60 +66,16 @@ creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 gc = gspread.authorize(creds)
 sh = gc.open_by_key(os.environ['SPREADSHEET_ID'])
 
-# Точка отсчёта ТОЛЬКО для самого первого запуска (пустой лист) — дальше
-# продолжаем от максимального rrd_id, уже сохранённого в листе.
 FIRST_RUN_DATE_FROM = os.environ.get('FINANCE_DATE_FROM', '').strip() or '2026-05-01'
-DATE_TO = (datetime.now() - timedelta(days=0)).strftime('%Y-%m-%d')
-
-FINANCE_HEADERS = [
-    "rrd_id", "Номер поставки", "Предмет", "Код номенклатуры", "Бренд", "Артикул поставщика",
-    "Название", "Размер", "Баркод", "Тип документа", "Обоснование для оплаты",
-    "Дата заказа покупателем", "Дата продажи", "Кол-во", "Цена розничная",
-    "Вайлдберриз реализовал Товар (Пр)", "Согласованный продуктовый дисконт, %",
-    "Промокод, %", "Итоговая согласованная скидка, %",
-    "Цена розничная с учетом согласованной скидки",
-    "Размер снижения кВВ из-за рейтинга, %", "Размер изменения кВВ из-за акции, %",
-    "Платформенные скидки, %", "Размер кВВ, %", "Размер кВВ без НДС, % Базовый",
-    "Итоговый кВВ без НДС, %",
-    "Вознаграждение с продаж до вычета услуг поверенного, без НДС",
-    "Возмещение за выдачу и возврат товаров на ПВЗ",
-    "Компенсация платёжных услуг/Комиссия за интеграцию платёжных сервисов",
-    "Размер компенсации платёжных услуг/Комиссии за интеграцию платёжных сервисов, %",
-    "Тип платежа: компенсация платёжных услуг/Комиссия за интеграцию платёжных сервисов",
-    "Вознаграждение Вайлдберриз (ВВ), без НДС", "НДС с Вознаграждения Вайлдберриз",
-    "К перечислению Продавцу за реализованный Товар", "Количество доставок",
-    "Количество возврата", "Услуги по доставке товара покупателю",
-    "Дата начала действия фиксации", "Дата конца действия фиксации",
-    "Признак услуги платной доставки", "Общая сумма штрафов",
-    "Корректировка Вознаграждения Вайлдберриз (ВВ)",
-    "Виды логистики, штрафов и корректировок ВВ",
-    "Стикер МП", "Наименование банка-эквайера", "Номер офиса",
-    "Наименование офиса доставки", "ИНН партнера", "Партнер", "Склад",
-    "Страна", "Тип коробов", "Номер таможенной декларации",
-    "Номер сборочного задания", "Код маркировки", "ШК", "Srid",
-    "Возмещение издержек по перевозке/по складским операциям с товаром",
-    "Организатор перевозки", "Хранение", "Удержания", "Операции на приемке",
-    "Фиксированный коэффициент склада по поставке",
-    "Признак продажи юридическому лицу", "Номер короба для обработки товара",
-    "Скидка по программе софинансирования", "Скидка Wibes, %",
-    "Компенсация скидки по программе лояльности",
-    "Стоимость участия в программе лояльности",
-    "Сумма баллов, удержанных по программе лояльности", "Id корзины заказа",
-    "Разовое изменение срока перечисления денежных средств",
-    "Id собственной акции продавца с дополнительной скидкой",
-    "Размер дополнительной скидки по собственной акции продавца, %",
-    "Способы продажи и тип товара",
-    "Уникальный идентификатор скидки лояльности от продавца",
-    "Размер скидки лояльности от продавца,%", "Id промокода",
-    "Скидка за промокод, %", "Id подменного артикула",
-    "Скидка по подменному артикулу, %", "Оптовая скидка для бизнеса, %",
-]
+DATE_TO = datetime.now().strftime('%Y-%m-%d')
+REWRITE_WINDOW_DAYS = 14
+rewrite_cutoff = (datetime.now() - timedelta(days=REWRITE_WINDOW_DAYS)).strftime('%Y-%m-%d')
 
 
-def wb_get(url, params=None, retries=5):
+def wb_post(url, body, retries=5):
     for attempt in range(retries):
         try:
-            r = requests.get(url, headers=HEADERS, params=params, timeout=60)
+            r = requests.post(url, headers=HEADERS, json=body, timeout=60)
             if r.status_code == 429:
                 wait = 60 * (attempt + 1)
                 print(f"  ⏳ 429 — жду {wait}с (попытка {attempt+1}/{retries})...")
@@ -117,6 +83,8 @@ def wb_get(url, params=None, retries=5):
                 continue
             if r.status_code == 200:
                 return r.json()
+            if r.status_code == 204:
+                return []
             print(f"  Ошибка {r.status_code}: {r.text[:300]}")
             return None
         except Exception as e:
@@ -125,102 +93,78 @@ def wb_get(url, params=None, retries=5):
     return None
 
 
+def num(v):
+    """Деньги приходят строками — аккуратно приводим к числу."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+# Те же русские заголовки, что были раньше — старые формулы их не заметят
+FINANCE_HEADERS = [
+    "rrd_id", "Номер поставки", "Предмет", "Код номенклатуры", "Бренд", "Артикул поставщика",
+    "Название", "Размер", "Баркод", "Тип документа", "Обоснование для оплаты",
+    "Дата заказа покупателем", "Дата продажи", "Кол-во", "Цена розничная",
+    "Вайлдберриз реализовал Товар (Пр)", "Размер кВВ, %", "Итоговый кВВ без НДС, %",
+    "Вознаграждение с продаж до вычета услуг поверенного, без НДС",
+    "Вознаграждение Вайлдберриз (ВВ), без НДС", "НДС с Вознаграждения Вайлдберриз",
+    "К перечислению Продавцу за реализованный Товар",
+    "Компенсация платёжных услуг/Комиссия за интеграцию платёжных сервисов",
+    "Размер компенсации платёжных услуг/Комиссии за интеграцию платёжных сервисов, %",
+    "Услуги по доставке товара покупателю", "Общая сумма штрафов",
+    "Корректировка Вознаграждения Вайлдберриз (ВВ)",
+    "Хранение", "Удержания", "Операции на приемке",
+    "Склад", "Страна", "Номер таможенной декларации", "Srid", "Номер отчёта",
+    "Период отчёта — с", "Период отчёта — по",
+]
+
+
 def row_from_item(item):
     return [
-        item.get("rrd_id", ""),
-        item.get("gi_id", ""),
-        item.get("subject_name", ""),
-        item.get("nm_id", ""),
-        item.get("brand_name", ""),
-        item.get("sa_name", ""),
-        item.get("ts_name", ""),
-        item.get("size", ""),
-        item.get("barcode", ""),
-        item.get("doc_type_name", ""),
-        item.get("supplier_oper_name", ""),
-        item.get("order_dt", "")[:10] if item.get("order_dt") else "",
-        item.get("sale_dt", "")[:10] if item.get("sale_dt") else "",
+        item.get("rrdId", ""),
+        item.get("giId", ""),
+        item.get("subjectName", ""),
+        item.get("nmId", ""),
+        item.get("brandName", ""),
+        item.get("vendorCode", ""),
+        item.get("title", ""),
+        item.get("techSize", ""),
+        item.get("sku", ""),
+        item.get("docTypeName", ""),
+        item.get("sellerOperName", ""),
+        item.get("orderDt", "")[:10] if item.get("orderDt") else "",
+        item.get("saleDt", "")[:10] if item.get("saleDt") else "",
         item.get("quantity", 0),
-        item.get("retail_price", 0),
-        item.get("retail_amount", 0),
-        item.get("sale_percent", 0),
-        item.get("promo_code_discount", 0),
-        item.get("total_discount_percent", 0),
-        item.get("retail_price_withdisc_rub", 0),
-        item.get("for_pay_initial", 0),
-        item.get("for_pay_wb_offset", 0),
-        item.get("platform_user_discount", 0),
-        item.get("commission_percent", 0),
-        item.get("commission_percent_base", 0),
-        item.get("for_pay_withdisc", 0),
-        item.get("ppvz_sales_commission", 0),
-        item.get("ppvz_for_pay_nds", 0),
-        item.get("acquiring_bank_commission", 0),
-        item.get("acquiring_bank_commission_percent", 0),
-        item.get("acquiring_bank_commission_type", ""),
-        item.get("ppvz_vw", 0),
-        item.get("ppvz_vw_nds", 0),
-        item.get("ppvz_for_pay", 0),
-        item.get("delivery_amount", 0),
-        item.get("return_amount", 0),
-        item.get("delivery_rub", 0),
-        item.get("fix_tariff_date_from", ""),
-        item.get("fix_tariff_date_to", ""),
-        item.get("is_kgvp_v2", ""),
-        item.get("penalty", 0),
-        item.get("additional_payment", 0),
-        item.get("rebill_logistic_cost_type", ""),
-        item.get("sticker_id", ""),
-        item.get("acquiring_bank", ""),
-        item.get("office_id", ""),
-        item.get("office_name", ""),
-        item.get("supplier_inn", ""),
-        item.get("partner_name", ""),
-        item.get("site_country", ""),
-        item.get("country_name", ""),
-        item.get("box_type_name", ""),
-        item.get("declaration_number", ""),
-        item.get("assembly_task_id", ""),
-        item.get("marking_code", ""),
-        item.get("shk_id", ""),
-        item.get("srid", ""),
-        item.get("rebill_logistic_cost", 0),
-        item.get("kiz", ""),
-        item.get("storage_fee", 0),
-        item.get("deduction", 0),
-        item.get("acceptance", 0),
-        item.get("supplier_promo", 0),
-        item.get("is_legal_entity", ""),
-        item.get("trbx_id", ""),
-        item.get("cofinance_price", 0),
-        item.get("wibes_discount", 0),
-        item.get("loyalty_discount_compensation", 0),
-        item.get("loyalty_price", 0),
-        item.get("loyalty_bonus_payment", 0),
-        item.get("basket_id", ""),
-        item.get("one_time_change_of_transfer_deadline", ""),
-        item.get("promo_id", ""),
-        item.get("promo_discount_percent", 0),
-        item.get("sales_method", ""),
-        item.get("unique_loyalty_discount_id", ""),
-        item.get("loyalty_discount_percent", 0),
-        item.get("promo_code_id", ""),
-        item.get("promo_code_discount_percent", 0),
-        item.get("substitute_article_id", ""),
-        item.get("substitute_article_discount_percent", 0),
-        item.get("wholesale_discount", 0),
+        num(item.get("retailPrice", 0)),
+        num(item.get("retailAmount", 0)),
+        item.get("kvw", 0),  # Размер кВВ, %
+        item.get("kvwBase", 0),  # используем как "Итоговый кВВ" пока не проверим точнее
+        num(item.get("ppvzSalesCommission", 0)),
+        num(item.get("ppvzReward", 0)),
+        num(item.get("vwNds", 0)),
+        num(item.get("forPay", 0)),
+        num(item.get("acquiringFee", 0)),
+        item.get("acquiringPercent", 0),
+        num(item.get("deliveryAmount", 0)),
+        num(item.get("penalty", 0)),
+        num(item.get("additionalPayment", 0)),
+        num(item.get("paidStorage", 0)),
+        num(item.get("deduction", 0)),
+        num(item.get("paidAcceptance", 0)),
+        item.get("officeName", ""),
+        item.get("country", ""),
+        item.get("declarationNumber", ""),
+        item.get("orderId", ""),
+        item.get("reportId", ""),
+        item.get("dateFrom", ""),
+        item.get("dateTo", ""),
     ]
 
 
-# ── 1. Лист 'finance' + разделяем на "старое" (не трогаем) и "окно
-#       последних 14 дней" (полностью перезабираем заново) ──────────
+# ── 1. Лист 'finance' + разделяем на "старое" и "окно последних 14 дней" ──
 print("\n→ Шаг 1: Проверяем лист 'finance'...")
-
-REWRITE_WINDOW_DAYS = 14
-rewrite_cutoff = (datetime.now() - timedelta(days=REWRITE_WINDOW_DAYS)).strftime('%Y-%m-%d')
-print(f"  Окно перезаписи: последние {REWRITE_WINDOW_DAYS} дней (с {rewrite_cutoff}) — "
-      f"WB дозаполняет/правит отчёт о реализации ещё 1-2 недели после публикации, "
-      f"поэтому эти строки каждый раз выкачиваем заново, а не просто дописываем.")
+print(f"  Окно перезаписи: последние {REWRITE_WINDOW_DAYS} дней (с {rewrite_cutoff})")
 
 try:
     ws = sh.worksheet('finance')
@@ -235,35 +179,32 @@ if is_first_run:
     ws.append_row(FINANCE_HEADERS)
     keep_rows = []
     date_from = FIRST_RUN_DATE_FROM
-    print(f"  Лист новый/пустой — первый запуск, период с {date_from} (весь сразу, окна перезаписи ещё нет)")
+    print(f"  Лист новый/пустой — первый запуск, период с {date_from}")
 else:
     all_values = ws.get_all_values()
     existing_headers = all_values[0]
     data_rows = all_values[1:]
-    # индекс колонки "Дата продажи" — по названию заголовка, не по позиции,
-    # на случай если порядок колонок когда-то изменится
     sale_date_idx = existing_headers.index('Дата продажи') if 'Дата продажи' in existing_headers else 12
-
     keep_rows = [r for r in data_rows if len(r) > sale_date_idx and r[sale_date_idx] < rewrite_cutoff]
     dropped = len(data_rows) - len(keep_rows)
     print(f"  Было строк: {len(data_rows)}. Оставляем (дата продажи < {rewrite_cutoff}): {len(keep_rows)}. "
-          f"Убираем на переперезабор (дата продажи >= {rewrite_cutoff}): {dropped}")
-    date_from = rewrite_cutoff  # забираем окно заново с нуля, rrd_id тут не помогает — нужен полный охват дат
+          f"Убираем на переперезабор: {dropped}")
+    date_from = rewrite_cutoff
 
+# ── 2. Тянем данные через НОВЫЙ метод (POST, camelCase, sales-reports) ──
 print(f"\n→ Шаг 2: Забираем строки за окно (dateFrom={date_from}, dateTo={DATE_TO})...")
 
 all_fetched_rows = []
-rrdid = 0
+rrd_id_cursor = 0
 seen_ids = set()
 api_failed = False
 
 while True:
-    data = wb_get(f'{STATS_URL}/api/v5/supplier/reportDetailByPeriod', params={
-        'dateFrom': date_from,
-        'dateTo': DATE_TO,
-        'limit': 100000,
-        'rrdid': rrdid,
-    })
+    body = {'dateFrom': date_from, 'dateTo': DATE_TO, 'limit': 100000}
+    if rrd_id_cursor:
+        body['rrdId'] = rrd_id_cursor
+
+    data = wb_post(f'{FINANCE_URL}/api/finance/v1/sales-reports/detailed', body)
     if data is None:
         print("❌ Нет ответа от API — прерываем на том, что уже собрали")
         api_failed = True
@@ -273,57 +214,41 @@ while True:
         break
 
     new_in_batch = 0
-    batch_max_rrd = rrdid
+    batch_max_rrd = rrd_id_cursor
     for item in data:
-        rid = item.get('rrd_id')
+        rid = item.get('rrdId')
         if rid is None or rid in seen_ids:
             continue
         seen_ids.add(rid)
-
-        # ДИАГНОСТИКА (один раз): печатаем сырой JSON первой строки с
-        # обоснованием "Продажа" — чтобы найти реальное имя поля для
-        # эквайринга, раз "acquiring_bank_commission" почему-то всегда 0.
-        if item.get('supplier_oper_name') == 'Продажа' and not globals().get('_diag_printed'):
-            print("\n  🔎 ДИАГНОСТИКА — сырой JSON первой строки 'Продажа' (пришли мне этот вывод):")
-            print("  " + json.dumps(item, ensure_ascii=False, indent=2)[:3000])
-            print()
-            globals()['_diag_printed'] = True
-
         all_fetched_rows.append(row_from_item(item))
         new_in_batch += 1
-        if rid > batch_max_rrd:
+        if isinstance(rid, (int, float)) and rid > batch_max_rrd:
             batch_max_rrd = rid
 
-    print(f"  Получено {len(data)} строк, из них новых в этой пачке: {new_in_batch} (всего собрано: {len(all_fetched_rows)})")
+    print(f"  Получено {len(data)} строк, из них новых в этой пачке: {new_in_batch} "
+          f"(всего собрано: {len(all_fetched_rows)})")
 
     if new_in_batch == 0 or len(data) < 100000:
         break
-    if batch_max_rrd <= rrdid:
+    if batch_max_rrd <= rrd_id_cursor:
         print("  ⚠️ Курсор не сдвинулся — останавливаемся, чтобы не зациклиться")
         break
-    rrdid = batch_max_rrd
+    rrd_id_cursor = batch_max_rrd
     time.sleep(2)
 
 print(f"\nИтого свежих строк за окно: {len(all_fetched_rows)}")
 
-# ── ЗАЩИТА ОТ ПОТЕРИ ДАННЫХ: если API реально не ответил (429/ошибка), а не
-# просто "за это окно честно 0 строк" — НЕ трогаем лист. Иначе мы стираем
-# уже сохранённые строки за окно и заменяем их пустотой. Именно так один
-# раз уже потерялись 2364 строки — эта проверка на это и стоит. ──────────
+# ── ЗАЩИТА ОТ ПОТЕРИ ДАННЫХ ──────────────────────────────────────
 if api_failed and not is_first_run:
     print("\n⛔ API не ответил (или ответил не полностью) за окно перезаписи.")
-    print(f"   Собрано частично: {len(all_fetched_rows)} строк — этого недостаточно, чтобы")
-    print("   быть уверенным, что окно забрано целиком. Лист НЕ трогаем — старые строки")
-    print("   за это окно остаются как были, чтобы их не потерять. Запусти скрипт снова позже.")
+    print(f"   Собрано частично: {len(all_fetched_rows)} строк — недостаточно, чтобы быть")
+    print("   уверенным, что окно забрано целиком. Лист НЕ трогаем. Запусти скрипт позже.")
     exit(1)
 
 # ── 3. Полная перезапись: старое (что оставили) + свежее окно ──────
 print("\n→ Шаг 3: Перезаписываем лист (старое без изменений + свежее окно)...")
 
-if is_first_run:
-    final_rows = all_fetched_rows
-else:
-    final_rows = keep_rows + all_fetched_rows
+final_rows = all_fetched_rows if is_first_run else (keep_rows + all_fetched_rows)
 
 ws.clear()
 ws.append_row(FINANCE_HEADERS)
