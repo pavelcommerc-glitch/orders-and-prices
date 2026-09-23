@@ -68,8 +68,8 @@ gc = gspread.authorize(creds)
 sh = gc.open_by_key(os.environ['SPREADSHEET_ID'])
 
 TODAY = datetime.now().strftime('%Y-%m-%d')
-DATE_FROM = os.environ.get('ADS_DATE_FROM', TODAY)
-DATE_TO = os.environ.get('ADS_DATE_TO', TODAY)
+DATE_FROM = os.environ.get('ADS_DATE_FROM', '').strip() or TODAY
+DATE_TO = os.environ.get('ADS_DATE_TO', '').strip() or TODAY
 print(f"Период снятия рекламной статистики: {DATE_FROM} — {DATE_TO}")
 
 # WB fullstats: максимум 31 день за один запрос — проверим и подскажем, если превысили
