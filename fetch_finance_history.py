@@ -185,8 +185,33 @@ else:
     existing_headers = all_values[0]
     data_rows = all_values[1:]
     sale_date_idx = existing_headers.index('Дата продажи') if 'Дата продажи' in existing_headers else 12
-    keep_rows = [r for r in data_rows if len(r) > sale_date_idx and r[sale_date_idx] < rewrite_cutoff]
-    dropped = len(data_rows) - len(keep_rows)
+    old_kept = [r for r in data_rows if len(r) > sale_date_idx and r[sale_date_idx] < rewrite_cutoff]
+    dropped = len(data_rows) - len(old_kept)
+
+    # ВАЖНО: старые строки могли быть записаны ещё старым скриптом (82 колонки,
+    # другой порядок), а сейчас пишем 36 колонок. Просто взять старые строки
+    # "как есть" и положить их под новые заголовки — колонки разъедутся
+    # (например, "Хранение" у старых строк окажется не там, где у новых).
+    # Поэтому переупаковываем КАЖДУЮ старую строку под НОВУЮ схему — по
+    # названию колонки, а не по позиции. Того, чего нет в старой схеме
+    # (например, "Итоговый кВВ без НДС, %" мог называться иначе или вообще
+    # отсутствовать) — оставляем пустым, не подставляем наугад.
+    if existing_headers == FINANCE_HEADERS:
+        # Уже в актуальной схеме (например, дозапись после сегодняшнего
+        # запуска) — переупаковывать не нужно.
+        keep_rows = old_kept
+    else:
+        old_idx = {name: i for i, name in enumerate(existing_headers)}
+        keep_rows = []
+        for r in old_kept:
+            new_row = []
+            for col_name in FINANCE_HEADERS:
+                i = old_idx.get(col_name)
+                new_row.append(r[i] if i is not None and i < len(r) else '')
+            keep_rows.append(new_row)
+        print(f"  Заголовки листа отличаются от текущей схемы — переупаковал "
+              f"{len(keep_rows)} старых строк по названиям колонок")
+
     print(f"  Было строк: {len(data_rows)}. Оставляем (дата продажи < {rewrite_cutoff}): {len(keep_rows)}. "
           f"Убираем на переперезабор: {dropped}")
     date_from = rewrite_cutoff
