@@ -284,11 +284,16 @@ print(f"\nИтого свежих строк за окно (до дедупли�
 # суммы (особенно логистика) оказывались завышены в разы. rrd_id для
 # дедупликации не годится (он новый при каждой перегенерации), а Srid
 # (уникальный идентификатор именно доставки/события) — стабилен.
-# Оставляем только САМУЮ СВЕЖУЮ версию (по номеру отчёта, он растёт
-# со временем) для каждого (Srid, Обоснование).
+# ВАЖНО: одна доставка (один Srid) может содержать НЕСКОЛЬКО товаров —
+# у каждого своя строка "Доставка" с одним и тем же Srid, но с РАЗНЫМ
+# артикулом. Дедуп только по (Srid, Обоснование) ошибочно схлопывал эти
+# законные разные строки в одну — занижало сумму. Добавляем артикул в
+# ключ, чтобы различать "тот же товар, перегенерированный отчётом" от
+# "разные товары в одной посылке".
 srid_idx = FINANCE_HEADERS.index('Srid')
 reason_idx = FINANCE_HEADERS.index('Обоснование для оплаты')
 report_idx = FINANCE_HEADERS.index('Номер отчёта')
+article_idx = FINANCE_HEADERS.index('Артикул поставщика')
 
 best_by_key = {}
 rows_without_srid = []
@@ -299,7 +304,7 @@ for row in all_fetched_rows:
         # просто оставляем как есть
         rows_without_srid.append(row)
         continue
-    key = (srid_val, row[reason_idx])
+    key = (srid_val, row[reason_idx], row[article_idx])
     prev = best_by_key.get(key)
     if prev is None or str(row[report_idx]) > str(prev[report_idx]):
         best_by_key[key] = row
