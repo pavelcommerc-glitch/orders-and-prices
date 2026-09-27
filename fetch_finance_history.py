@@ -169,7 +169,7 @@ def row_from_item(item):
         item.get("officeName", ""),
         item.get("country", ""),
         item.get("declarationNumber", ""),
-        item.get("orderId", ""),
+        item.get("srid", ""),
         item.get("reportId", ""),
         item.get("dateFrom", ""),
         item.get("dateTo", ""),
@@ -275,7 +275,40 @@ while True:
     rrd_id_cursor = batch_max_rrd
     time.sleep(2)
 
-print(f"\nИтого свежих строк за окно: {len(all_fetched_rows)}")
+print(f"\nИтого свежих строк за окно (до дедупликации перегенераций): {len(all_fetched_rows)}")
+
+# ── ДЕДУПЛИКАЦИЯ ПЕРЕГЕНЕРАЦИЙ ОТЧЁТА ────────────────────────────
+# WB периодически ПЕРЕГЕНЕРИРУЕТ ежедневный отчёт за одну и ту же дату
+# несколько раз (разные "Номер отчёта" с пересекающимися датами и
+# РАЗНЫМИ rrd_id для одних и тех же реальных событий) — из-за этого
+# суммы (особенно логистика) оказывались завышены в разы. rrd_id для
+# дедупликации не годится (он новый при каждой перегенерации), а Srid
+# (уникальный идентификатор именно доставки/события) — стабилен.
+# Оставляем только САМУЮ СВЕЖУЮ версию (по номеру отчёта, он растёт
+# со временем) для каждого (Srid, Обоснование).
+srid_idx = FINANCE_HEADERS.index('Srid')
+reason_idx = FINANCE_HEADERS.index('Обоснование для оплаты')
+report_idx = FINANCE_HEADERS.index('Номер отчёта')
+
+best_by_key = {}
+rows_without_srid = []
+for row in all_fetched_rows:
+    srid_val = row[srid_idx]
+    if not srid_val:
+        # нет srid (бывает у некоторых типов строк) — дедуп не применяем,
+        # просто оставляем как есть
+        rows_without_srid.append(row)
+        continue
+    key = (srid_val, row[reason_idx])
+    prev = best_by_key.get(key)
+    if prev is None or str(row[report_idx]) > str(prev[report_idx]):
+        best_by_key[key] = row
+
+deduped_rows = list(best_by_key.values()) + rows_without_srid
+removed = len(all_fetched_rows) - len(deduped_rows)
+print(f"Убрано дублей от перегенераций отчёта: {removed}")
+print(f"Итого свежих строк после дедупликации: {len(deduped_rows)}")
+all_fetched_rows = deduped_rows
 
 # ── ЗАЩИТА ОТ ПОТЕРИ ДАННЫХ ──────────────────────────────────────
 if api_failed and not is_first_run:
