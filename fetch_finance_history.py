@@ -146,7 +146,7 @@ def row_from_item(item):
         num(item.get("forPay", 0)),
         num(item.get("acquiringFee", 0)),
         item.get("acquiringPercent", 0),
-        num(item.get("deliveryAmount", 0)),
+        num(item.get("deliveryService", 0)),  # реальная сумма логистики, ₽ (не deliveryAmount — это счётчик!)
         num(item.get("penalty", 0)),
         num(item.get("additionalPayment", 0)),
         num(item.get("paidStorage", 0)),
