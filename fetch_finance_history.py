@@ -11,6 +11,11 @@ Wildberries (объявлено к отключению 15 июля 2026, отк
   Категория токена: "Финансы" (НЕ Statistics — проверь в личном кабинете WB,
   что она включена, иначе 401/403)
 
+ВАЖНО: в теле запроса передаём "period": "daily" — иначе метод отдаёт
+отчёт ПО НЕДЕЛЯМ (со своей задержкой публикации в 1-2 дня после закрытия
+недели), из-за чего последние несколько дней всегда были бы пустыми.
+С "period": "daily" данные приходят посвежее, по дням.
+
 Поля в ответе теперь camelCase, суммы приходят СТРОКАМИ. В сам лист 'finance'
 пишем те же русские названия колонок, что и раньше — старые формулы в
 Apps Script ("по_артикулам", "расчет") трогать не нужно, меняется только
@@ -68,8 +73,17 @@ sh = gc.open_by_key(os.environ['SPREADSHEET_ID'])
 
 FIRST_RUN_DATE_FROM = os.environ.get('FINANCE_DATE_FROM', '').strip() or '2026-05-01'
 DATE_TO = datetime.now().strftime('%Y-%m-%d')
-REWRITE_WINDOW_DAYS = 14
+
+# "daily" — частые прогоны, свежие (но предварительные) данные по дням.
+# "weekly" — раз в неделю, перетирает то же окно официальным недельным
+# отчётом (более точным, но появляется с задержкой в 1-2 дня после
+# закрытия недели). Окно перезаписи для weekly беру шире (21 день вместо
+# 14) — чтобы точно захватить хотя бы одну полностью закрытую неделю
+# целиком, а не обрезать её посередине.
+REPORT_PERIOD = os.environ.get('REPORT_PERIOD', '').strip().lower() or 'daily'
+REWRITE_WINDOW_DAYS = 21 if REPORT_PERIOD == 'weekly' else 14
 rewrite_cutoff = (datetime.now() - timedelta(days=REWRITE_WINDOW_DAYS)).strftime('%Y-%m-%d')
+print(f"Режим отчёта: period={REPORT_PERIOD}, окно перезаписи {REWRITE_WINDOW_DAYS} дней")
 
 
 def wb_post(url, body, retries=5):
@@ -225,7 +239,7 @@ seen_ids = set()
 api_failed = False
 
 while True:
-    body = {'dateFrom': date_from, 'dateTo': DATE_TO, 'limit': 100000}
+    body = {'dateFrom': date_from, 'dateTo': DATE_TO, 'limit': 100000, 'period': REPORT_PERIOD}
     if rrd_id_cursor:
         body['rrdId'] = rrd_id_cursor
 
