@@ -1,4 +1,4 @@
-name: Fetch Finance History (все магазины)
+name: Fetch Finance History (все магазины) — ежедневно
 on:
   workflow_dispatch:
     inputs:
@@ -30,3 +30,4 @@ jobs:
           SPREADSHEET_ID: ${{ matrix.store == 'MOTORKRAFT' && secrets.SPREADSHEET_ID || secrets[format('SPREADSHEET_ID_{0}', matrix.store)] }}
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
           FINANCE_DATE_FROM: ${{ github.event.inputs.date_from }}
+          REPORT_PERIOD: daily
