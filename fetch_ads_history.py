@@ -14,8 +14,13 @@ fetch_stocks_history.py, только источник — WB Promotion (Adverti
 
 ДИАПАЗОН ДАТ: метод отдаёт статистику по дням сразу за период до 31 дня в
 ОДНОМ запросе (не нужно дёргать API по одному дню). По умолчанию скрипт
-берёт только сегодня (для ежедневного крона). Для разового бэкафилла задай
-переменные окружения ADS_DATE_FROM / ADS_DATE_TO:
+берёт ВЧЕРА + СЕГОДНЯ (для ежедневного крона) — не только "сегодня", потому
+что крон идёт рано утром (03:30), и "сегодня" на тот момент — это первые
+пару часов суток, почти весь расход ещё не нагорел. Раньше это приводило
+к тому, что вчерашний день навсегда оставался с заниженным расходом (строка
+с датой уже записана — скрипт её больше не трогал). Теперь при каждом
+запуске окно [вчера, сегодня] ПЕРЕЗАПИСЫВАЕТСЯ целиком свежими данными —
+не просто дописывается. Для разового бэкафилла задай ADS_DATE_FROM/ADS_DATE_TO:
 
   export ADS_DATE_FROM='2026-08-11'
   export ADS_DATE_TO='2026-08-24'
@@ -68,7 +73,8 @@ gc = gspread.authorize(creds)
 sh = gc.open_by_key(os.environ['SPREADSHEET_ID'])
 
 TODAY = datetime.now().strftime('%Y-%m-%d')
-DATE_FROM = os.environ.get('ADS_DATE_FROM', '').strip() or TODAY
+YESTERDAY = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+DATE_FROM = os.environ.get('ADS_DATE_FROM', '').strip() or YESTERDAY
 DATE_TO = os.environ.get('ADS_DATE_TO', '').strip() or TODAY
 print(f"Период снятия рекламной статистики: {DATE_FROM} — {DATE_TO}")
 
@@ -148,6 +154,7 @@ SLEEP_BETWEEN_BATCHES = 22  # секунд — лимит 3 запроса/ми�
 
 # (дата, nm_id) -> агрегированные показатели за эту дату
 agg = {}
+any_batch_failed = False
 
 batches = [all_advert_ids[i:i + BATCH_SIZE] for i in range(0, len(all_advert_ids), BATCH_SIZE)]
 for bi, batch in enumerate(batches):
@@ -180,6 +187,7 @@ for bi, batch in enumerate(batches):
                         agg[key]['sum_price'] += nm.get('sum_price', 0) or 0
     else:
         print(f"    ⚠️ Пачка {bi+1} не отдала данные (см. ошибку выше)")
+        any_batch_failed = True
 
     if bi < len(batches) - 1:
         print(f"    ждём {SLEEP_BETWEEN_BATCHES}с (лимит API)...")
@@ -219,45 +227,62 @@ HEADERS_ROW = ['Дата', 'Артикул поставщика', 'nmID', 'На�
                'Показы', 'Клики', 'CTR, %', 'CPC, ₽',
                'Заказы (из рекламы)', 'Сумма заказов из рекламы, ₽', 'Расход на рекламу, ₽']
 
+# ── ЗАЩИТА ОТ ПОТЕРИ ДАННЫХ: если хоть одна пачка кампаний не ответила —
+# не трогаем лист. Иначе мы бы стёрли уже записанные (полные) строки за
+# это окно и заменили их заведомо неполными (та пачка, что упала, туда
+# просто не попадёт). ────────────────────────────────────────────────
+if any_batch_failed:
+    print("\n⛔ Хотя бы одна пачка кампаний не ответила — данные за окно неполные.")
+    print("   Лист НЕ трогаем, чтобы не заменить уже записанные полные строки")
+    print("   неполными. Запусти скрипт ещё раз позже.")
+    exit(1)
+
+is_new_sheet = False
 try:
     ws = sh.worksheet('ads_history')
     existing = ws.get_all_values()
     if not existing:
         ws.append_row(HEADERS_ROW)
-        existing_dates = set()
+        existing_rows = []
+        is_new_sheet = True
     else:
-        existing_dates = set(row[0] for row in existing[1:] if row)
+        existing_rows = existing[1:]
 except Exception:
     ws = sh.add_worksheet(title='ads_history', rows=200000, cols=len(HEADERS_ROW))
     ws.append_row(HEADERS_ROW)
-    existing_dates = set()
+    existing_rows = []
+    is_new_sheet = True
     print("  Лист 'ads_history' создан")
 
-# фильтруем только те строки, чья дата ещё не записана (не всё разом, как раньше,
-# а по датам — при бэкафилле часть диапазона могла уже быть записана раньше)
-rows_to_write = [r for r in rows if r[0] not in existing_dates]
-skipped = len(rows) - len(rows_to_write)
-if skipped:
-    print(f"  Пропущено (даты уже есть в истории): {skipped} строк")
+# ВАЖНО (исправлено): раньше строки с уже записанной датой просто
+# пропускались — значит если в первый раз за сегодня (рано утром) данные
+# были неполными, они такими и оставались НАВСЕГДА. Теперь вместо
+# "пропустить, если дата уже есть" — "выбросить старые строки за даты
+# из окна [DATE_FROM, DATE_TO] и записать их заново, целиком свежими".
+# Всё, что ВНЕ этого окна (более старые даты), не трогаем — как в finance.
+keep_rows = [r for r in existing_rows if len(r) > 0 and not (DATE_FROM <= r[0] <= DATE_TO)]
+dropped = len(existing_rows) - len(keep_rows)
+if dropped:
+    print(f"  Убрано старых строк за окно {DATE_FROM}–{DATE_TO} (будут перезаписаны свежими): {dropped}")
 
-if not rows_to_write:
-    print("⚠️  Всё уже записано — новых строк нет")
-    exit(0)
+final_rows = keep_rows + rows
+print(f"  Строк вне окна (не трогаем): {len(keep_rows)}, свежих за окно: {len(rows)}, итого: {len(final_rows)}")
 
+ws.clear()
+ws.append_row(HEADERS_ROW)
 batch_size = 2000
-for i in range(0, len(rows_to_write), batch_size):
-    batch = rows_to_write[i:i + batch_size]
+for i in range(0, len(final_rows), batch_size):
+    batch = final_rows[i:i + batch_size]
     ws.append_rows(batch, value_input_option='USER_ENTERED')
     print(f"  Записано строк {i+1}–{i+len(batch)}")
     time.sleep(1)
 
-if not existing_dates:
-    ws.format('A1:K1', {
-        'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
-        'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18},
-    })
-    ws.freeze(rows=1, cols=2)
+ws.format('A1:K1', {
+    'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
+    'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18},
+})
+ws.freeze(rows=1, cols=2)
 
 print(f"\n✅ Готово!")
-print(f"   Период: {DATE_FROM} — {DATE_TO}")
-print(f"   Строк записано: {len(rows_to_write)}")
+print(f"   Период (перезаписан): {DATE_FROM} — {DATE_TO}")
+print(f"   Итого строк в 'ads_history': {len(final_rows)}")
