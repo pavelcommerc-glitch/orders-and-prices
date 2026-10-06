@@ -165,7 +165,11 @@ for bi, batch in enumerate(batches):
         'beginDate': DATE_FROM,
         'endDate': DATE_TO,
     })
-    if resp:
+    if resp is not None:
+        # resp == [] — это НЕ сбой: по этим кампаниям за окно просто нет
+        # статистики (пауза/завершены). Сбой = None (wb_get уже напечатал причину).
+        if not resp:
+            print(f"    (пачка {bi+1}: статистики за окно нет — это нормально для неактивных кампаний)")
         for campaign in resp:
             for day in campaign.get('days', []):
                 # day['date'] приходит как "2026-08-24T00:00:00Z" — берём только дату
