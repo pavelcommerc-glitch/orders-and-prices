@@ -76,6 +76,7 @@ TODAY = datetime.now().strftime('%Y-%m-%d')
 YESTERDAY = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 DATE_FROM = os.environ.get('ADS_DATE_FROM', '').strip() or YESTERDAY
 DATE_TO = os.environ.get('ADS_DATE_TO', '').strip() or TODAY
+print("fetch_ads_history v3 (пустой ответ/null = не сбой)")
 print(f"Период снятия рекламной статистики: {DATE_FROM} — {DATE_TO}")
 
 # WB fullstats: максимум 31 день за один запрос — проверим и подскажем, если превысили
@@ -86,7 +87,11 @@ if _days_span > 31:
     exit(1)
 
 
-def wb_get(url, params=None, retries=5):
+def wb_get_ex(url, params=None, retries=5):
+    """Возвращает (ok, data). ok=False — РЕАЛЬНЫЙ сбой (429 до исчерпания
+    попыток, код не 200, исключение). ok=True — WB ответил 200; data может
+    быть списком/словарём, а также пустым: WB для "нет статистики" отдаёт
+    и [] и null — оба приводим к [] (это не ошибка)."""
     for attempt in range(retries):
         try:
             r = requests.get(url, headers=HEADERS, params=params, timeout=30)
@@ -96,13 +101,19 @@ def wb_get(url, params=None, retries=5):
                 time.sleep(wait)
                 continue
             if r.status_code == 200:
-                return r.json()
+                data = r.json()
+                return True, (data if data is not None else [])
             print(f"  Ошибка {r.status_code}: {r.text[:300]}")
-            return None
+            return False, None
         except Exception as e:
             print(f"  Исключение: {e}")
             time.sleep(10)
-    return None
+    return False, None
+
+
+def wb_get(url, params=None, retries=5):
+    ok, data = wb_get_ex(url, params, retries)
+    return data if ok else None
 
 
 # ── 0. Справочник nmId -> (артикул, название) из кэша nomenclature ──
@@ -160,14 +171,14 @@ batches = [all_advert_ids[i:i + BATCH_SIZE] for i in range(0, len(all_advert_ids
 for bi, batch in enumerate(batches):
     ids_param = ','.join(str(x) for x in batch)
     print(f"  Пачка {bi+1}/{len(batches)}: {len(batch)} кампаний")
-    resp = wb_get(f'{ADVERT_URL}/adv/v3/fullstats', params={
+    ok, resp = wb_get_ex(f'{ADVERT_URL}/adv/v3/fullstats', params={
         'ids': ids_param,
         'beginDate': DATE_FROM,
         'endDate': DATE_TO,
     })
-    if resp is not None:
-        # resp == [] — это НЕ сбой: по этим кампаниям за окно просто нет
-        # статистики (пауза/завершены). Сбой = None (wb_get уже напечатал причину).
+    if ok:
+        # ok=True и пустой resp — это НЕ сбой: по этим кампаниям за окно
+        # просто нет статистики (пауза/завершены).
         if not resp:
             print(f"    (пачка {bi+1}: статистики за окно нет — это нормально для неактивных кампаний)")
         for campaign in resp:
@@ -190,7 +201,7 @@ for bi, batch in enumerate(batches):
                         agg[key]['sum'] += nm.get('sum', 0) or 0
                         agg[key]['sum_price'] += nm.get('sum_price', 0) or 0
     else:
-        print(f"    ⚠️ Пачка {bi+1} не отдала данные (см. ошибку выше)")
+        print(f"    ⚠️ Пачка {bi+1}: РЕАЛЬНЫЙ сбой запроса (причина — в строке выше)")
         any_batch_failed = True
 
     if bi < len(batches) - 1:
