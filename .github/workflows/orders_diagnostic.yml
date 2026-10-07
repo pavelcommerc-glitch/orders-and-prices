@@ -1,0 +1,30 @@
+name: Orders Diagnostic (сверка заказов API vs лист)
+on:
+  workflow_dispatch:
+    inputs:
+      store:
+        description: 'Магазин'
+        type: choice
+        default: MOTORKRAFT
+        options: [MOTORKRAFT, B, F, G, R, T, Z]
+      date:
+        description: 'День для разбора YYYY-MM-DD (пусто = 3 дня назад; бери день старше 2 суток)'
+        required: false
+        default: ''
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - run: pip install gspread google-auth requests
+      - run: python orders_diagnostic.py
+        env:
+          WB_TOKEN: ${{ github.event.inputs.store == 'MOTORKRAFT' && secrets.WB_TOKEN || secrets[format('WB_TOKEN_{0}', github.event.inputs.store)] }}
+          SPREADSHEET_ID: ${{ github.event.inputs.store == 'MOTORKRAFT' && secrets.SPREADSHEET_ID || secrets[format('SPREADSHEET_ID_{0}', github.event.inputs.store)] }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          DIAG_DATE: ${{ github.event.inputs.date }}
