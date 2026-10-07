@@ -1,0 +1,29 @@
+name: Funnel Diagnostic (воронка продаж vs Statistics API)
+on:
+  workflow_dispatch:
+    inputs:
+      store:
+        description: 'Магазин (тот же, что в кабинете, откуда берёшь цифры)'
+        type: choice
+        default: MOTORKRAFT
+        options: [MOTORKRAFT, B, F, G, R, T, Z]
+      date:
+        description: 'День YYYY-MM-DD (пусто = 3 дня назад; бери день старше 2 суток)'
+        required: false
+        default: ''
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python funnel_diagnostic.py
+        env:
+          WB_TOKEN: ${{ github.event.inputs.store == 'MOTORKRAFT' && secrets.WB_TOKEN || secrets[format('WB_TOKEN_{0}', github.event.inputs.store)] }}
+          DIAG_DATE: ${{ github.event.inputs.date }}
+          DIAG_STORE: ${{ github.event.inputs.store }}
