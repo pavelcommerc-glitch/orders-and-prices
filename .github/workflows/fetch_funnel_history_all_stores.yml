@@ -1,0 +1,37 @@
+name: Fetch Funnel History (все магазины) — заказы из воронки продаж
+on:
+  workflow_dispatch:
+    inputs:
+      date_from:
+        description: 'FUNNEL_DATE_FROM (YYYY-MM-DD) — для первичного заполнения (например 30 дней назад). Пусто = последние 7 дней.'
+        required: false
+        default: ''
+      date_to:
+        description: 'FUNNEL_DATE_TO (YYYY-MM-DD). Пусто = сегодня.'
+        required: false
+        default: ''
+  schedule:
+    - cron: '30 4 * * *'   # после sales (04:00), до finance (05:00)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60    # первичное заполнение за 30 дней ≈ 15 мин на магазин (лимит ~3 запроса/мин)
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [MOTORKRAFT, B, F, G, R, T, Z]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - run: pip install gspread google-auth requests
+      - name: Run for ${{ matrix.store }}
+        run: python fetch_funnel_history.py
+        env:
+          WB_TOKEN: ${{ matrix.store == 'MOTORKRAFT' && secrets.WB_TOKEN || secrets[format('WB_TOKEN_{0}', matrix.store)] }}
+          SPREADSHEET_ID: ${{ matrix.store == 'MOTORKRAFT' && secrets.SPREADSHEET_ID || secrets[format('SPREADSHEET_ID_{0}', matrix.store)] }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          FUNNEL_DATE_FROM: ${{ github.event.inputs.date_from }}
+          FUNNEL_DATE_TO: ${{ github.event.inputs.date_to }}
