@@ -26,6 +26,13 @@ fetch_stocks_history.py, только источник — WB Promotion (Adverti
   export ADS_DATE_TO='2026-08-24'
   python fetch_ads_history.py
 
+СНИМОК КАМПАНИЙ (лист 'ads_campaigns', перезаписывается целиком при каждом запуске):
+  какие кампании сейчас активны / на паузе / готовы к запуску, их остаток бюджета и
+  какие карточки (nmID -> артикул) в них входят. Это состояние НА МОМЕНТ запуска, не история.
+    GET  /api/advert/v2/adverts?statuses=4,9,11   — кампании, статус, карточки
+    POST /api/advert/v2/budget {advertIds}        — остаток бюджета (до 50 кампаний за запрос)
+  Старый GET /adv/v1/budget помечен у WB устаревшим — не используем.
+
 nmId -> артикул сопоставляется через те же кэш-листы 'nomenclature'/'barcodes',
 что пишет fetch_stocks_history.py — этот скрипт их только ЧИТАЕТ, не трогает.
 Так что fetch_stocks_history.py должен был отработать хотя бы раз раньше.
@@ -76,7 +83,7 @@ TODAY = datetime.now().strftime('%Y-%m-%d')
 YESTERDAY = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
 DATE_FROM = os.environ.get('ADS_DATE_FROM', '').strip() or YESTERDAY
 DATE_TO = os.environ.get('ADS_DATE_TO', '').strip() or TODAY
-print("fetch_ads_history v3 (пустой ответ/null = не сбой)")
+print("fetch_ads_history v5 (+снимок кампаний: статус и бюджет -> лист ads_campaigns)")
 print(f"Период снятия рекламной статистики: {DATE_FROM} — {DATE_TO}")
 
 # WB fullstats: максимум 31 день за один запрос — проверим и подскажем, если превысили
@@ -100,6 +107,15 @@ def wb_get_ex(url, params=None, retries=5):
                 print(f"  ⏳ 429 — жду {wait}с (попытка {attempt+1}/{retries})...")
                 time.sleep(wait)
                 continue
+            if r.status_code >= 500:
+                # 5xx — временный сбой на стороне WB (например "canceling statement
+                # due to conflict with recovery", SQLSTATE 40001: запрос отменила
+                # реплика БД). Лечится повтором — не сдаёмся сразу.
+                wait = 30 * (attempt + 1)
+                print(f"  ⚠️ {r.status_code} от WB (временный сбой сервера) — повтор через {wait}с "
+                      f"(попытка {attempt+1}/{retries}): {r.text[:160]}")
+                time.sleep(wait)
+                continue
             if r.status_code == 200:
                 data = r.json()
                 return True, (data if data is not None else [])
@@ -114,6 +130,30 @@ def wb_get_ex(url, params=None, retries=5):
 def wb_get(url, params=None, retries=5):
     ok, data = wb_get_ex(url, params, retries)
     return data if ok else None
+
+
+def wb_post_ex(url, body, retries=5):
+    """POST -> (ok, data). Те же правила повторов, что у wb_get_ex."""
+    for attempt in range(retries):
+        try:
+            r = requests.post(url, headers=HEADERS, json=body, timeout=30)
+            if r.status_code == 429:
+                wait = 30 * (attempt + 1)
+                print(f"  ⏳ 429 — жду {wait}с (попытка {attempt+1}/{retries})...")
+                time.sleep(wait); continue
+            if r.status_code >= 500:
+                wait = 30 * (attempt + 1)
+                print(f"  ⚠️ {r.status_code} от WB — повтор через {wait}с (попытка {attempt+1}/{retries}): {r.text[:160]}")
+                time.sleep(wait); continue
+            if r.status_code == 200:
+                data = r.json()
+                return True, (data if data is not None else {})
+            print(f"  Ошибка {r.status_code}: {r.text[:300]}")
+            return False, None
+        except Exception as e:
+            print(f"  Исключение: {e}")
+            time.sleep(10)
+    return False, None
 
 
 # ── 0. Справочник nmId -> (артикул, название) из кэша nomenclature ──
@@ -131,6 +171,62 @@ try:
 except Exception as e:
     print(f"⚠️  Не удалось прочитать 'nomenclature': {e} — "
           f"названия/артикулы будут пустыми там, где не найдём по nmId")
+
+# ── 0б. Снимок кампаний: статус + остаток бюджета + карточки -> лист 'ads_campaigns' ──
+# Независим от основной выгрузки ниже: при любой ошибке только предупреждение, ads_history
+# это не ломает; при неполных данных старый снимок НЕ перезаписываем.
+print("\n→ Шаг 0б: Снимок рекламных кампаний (статус, бюджет)...")
+STATUS_TEXT = {9: 'Активна', 11: 'На паузе', 4: 'Готова к запуску'}
+CAMP_HEADER = ['Дата снимка', 'ID кампании', 'Название кампании', 'Код статуса', 'Статус',
+               'Бюджет кампании, ₽', 'nmID', 'Артикул поставщика']
+
+
+def snapshot_campaigns():
+    ok, data = wb_get_ex(f'{ADVERT_URL}/api/advert/v2/adverts', params={'statuses': '4,9,11'})
+    if not ok:
+        return None
+    adverts = data.get('adverts', []) if isinstance(data, dict) else []
+    ids = [a['id'] for a in adverts if a.get('id')]
+    budgets = {}
+    for i in range(0, len(ids), 50):
+        ok, b = wb_post_ex(f'{ADVERT_URL}/api/advert/v2/budget', {'advertIds': ids[i:i + 50]})
+        if not ok:
+            return None
+        for x in (b.get('adverts', []) if isinstance(b, dict) else []):
+            budgets[x.get('advertId')] = x.get('total')
+        time.sleep(3.5)          # лимит бюджета: интервал 3 с
+    rows = []
+    for a in sorted(adverts, key=lambda a: (a.get('status') != 9, a.get('id', 0))):
+        st = int(a.get('status', 0))
+        name = (a.get('settings') or {}).get('name', '')
+        bud = budgets.get(a.get('id'), '')
+        nms = a.get('nm_settings') or [{}]
+        for nm in nms:
+            nm_id = nm.get('nm_id', '')
+            art = nm_to_article.get(str(nm_id), ('', ''))[0] if nm_id != '' else ''
+            rows.append([TODAY, a.get('id'), name, st, STATUS_TEXT.get(st, str(st)), bud, nm_id, art])
+    return rows
+
+
+try:
+    camp_rows = snapshot_campaigns()
+    if camp_rows is None:
+        print("⚠️  Снимок кампаний получить не удалось — лист 'ads_campaigns' НЕ трогаем (остаётся прошлый снимок)")
+    else:
+        try:
+            ws_c = sh.worksheet('ads_campaigns')
+        except Exception:
+            ws_c = sh.add_worksheet(title='ads_campaigns', rows=100, cols=len(CAMP_HEADER))
+        ws_c.clear()
+        ws_c.append_row(CAMP_HEADER)
+        for i in range(0, len(camp_rows), 2000):
+            ws_c.append_rows(camp_rows[i:i + 2000], value_input_option='USER_ENTERED')
+        n_act = len({r[1] for r in camp_rows if r[3] == 9})
+        no_art = sum(1 for r in camp_rows if r[3] == 9 and not r[7])
+        print(f"✅ Снимок кампаний: {len({r[1] for r in camp_rows})} кампаний (активных {n_act}), строк {len(camp_rows)}"
+              + (f"; ⚠️ у {no_art} строк активных кампаний артикул не найден в nomenclature" if no_art else ""))
+except Exception as e:
+    print(f"⚠️  Снимок кампаний: неожиданная ошибка ({e}) — основная выгрузка продолжается")
 
 # ── 1. Список кампаний ────────────────────────────────────────────
 print("\n→ Шаг 1: Получаем список рекламных кампаний...")
