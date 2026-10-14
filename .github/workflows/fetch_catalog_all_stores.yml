@@ -1,0 +1,26 @@
+name: Fetch Catalog (все магазины) — карточки, габариты, баркоды, объём по замерам WB
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 1'   # раз в неделю, понедельник 03:00 UTC (карточки меняются редко)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30    # на магазин: карточки + рейтинги ≈ 2–3 мин, отчёт об остатках ≈ 3–8 мин (лимиты WB ~1 запрос/мин)
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [MOTORKRAFT, B, F, G, R, T, Z]
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - run: pip install gspread google-auth requests
+      - name: Run for ${{ matrix.store }}
+        run: python fetch_catalog.py
+        env:
+          WB_TOKEN: ${{ matrix.store == 'MOTORKRAFT' && secrets.WB_TOKEN || secrets[format('WB_TOKEN_{0}', matrix.store)] }}
+          SPREADSHEET_ID: ${{ matrix.store == 'MOTORKRAFT' && secrets.SPREADSHEET_ID || secrets[format('SPREADSHEET_ID_{0}', matrix.store)] }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
