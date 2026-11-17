@@ -65,6 +65,7 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
+from sheets_history import prepare_update, publish_updates, sheets_retry
 
 WB_TOKEN = os.environ['WB_TOKEN']
 HEADERS = {'Authorization': WB_TOKEN, 'Content-Type': 'application/json'}
@@ -77,7 +78,7 @@ SCOPES = [
 creds_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
 creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 gc = gspread.authorize(creds)
-sh = gc.open_by_key(os.environ['SPREADSHEET_ID'])
+sh = sheets_retry(gc.open_by_key, os.environ['SPREADSHEET_ID'])
 
 TODAY = datetime.now().strftime('%Y-%m-%d')
 YESTERDAY = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
@@ -88,8 +89,8 @@ print(f"Период снятия рекламной статистики: {DATE
 
 # WB fullstats: максимум 31 день за один запрос — проверим и подскажем, если превысили
 _days_span = (datetime.strptime(DATE_TO, '%Y-%m-%d') - datetime.strptime(DATE_FROM, '%Y-%m-%d')).days + 1
-if _days_span > 31:
-    print(f"❌ Период {_days_span} дней — больше лимита WB (31 день за раз). "
+if not 1 <= _days_span <= 31:
+    print(f"❌ Период {_days_span} дней — требуется от 1 до 31 дня. "
           f"Разбей на несколько запусков с разными ADS_DATE_FROM/ADS_DATE_TO.")
     exit(1)
 
@@ -161,20 +162,19 @@ print("\n→ Шаг 0: Читаем справочник 'nomenclature' (пиш�
 
 nm_to_article = {}
 try:
-    nom_ws = sh.worksheet('nomenclature')
-    nom_data = nom_ws.get_all_values()[1:]
+    nom_ws = sheets_retry(sh.worksheet, 'nomenclature')
+    nom_data = sheets_retry(nom_ws.get_all_values)[1:]
     for row in nom_data:
         if len(row) >= 3 and row[1]:
             article, nm_id, name = row[0], row[1], row[2]
             nm_to_article[nm_id] = (article, name)
     print(f"  Артикулов в справочнике: {len(nm_to_article)}")
-except Exception as e:
+except gspread.exceptions.WorksheetNotFound as e:
     print(f"⚠️  Не удалось прочитать 'nomenclature': {e} — "
           f"названия/артикулы будут пустыми там, где не найдём по nmId")
 
 # ── 0б. Снимок кампаний: статус + остаток бюджета + карточки -> лист 'ads_campaigns' ──
-# Независим от основной выгрузки ниже: при любой ошибке только предупреждение, ads_history
-# это не ломает; при неполных данных старый снимок НЕ перезаписываем.
+# Основная выгрузка продолжится при сбое снимка. Задание завершится ошибкой для повтора.
 print("\n→ Шаг 0б: Снимок рекламных кампаний (статус, бюджет)...")
 STATUS_TEXT = {9: 'Активна', 11: 'На паузе', 4: 'Готова к запуску'}
 CAMP_HEADER = ['Дата снимка', 'ID кампании', 'Название кампании', 'Код статуса', 'Статус',
@@ -183,9 +183,9 @@ CAMP_HEADER = ['Дата снимка', 'ID кампании', 'Название
 
 def snapshot_campaigns():
     ok, data = wb_get_ex(f'{ADVERT_URL}/api/advert/v2/adverts', params={'statuses': '4,9,11'})
-    if not ok:
+    if not ok or not isinstance(data, dict) or not isinstance(data.get('adverts'), list):
         return None
-    adverts = data.get('adverts', []) if isinstance(data, dict) else []
+    adverts = data['adverts']
     ids = [a['id'] for a in adverts if a.get('id')]
     budgets = {}
     for i in range(0, len(ids), 50):
@@ -208,38 +208,29 @@ def snapshot_campaigns():
     return rows
 
 
+snapshot_failed = False
 try:
     camp_rows = snapshot_campaigns()
     if camp_rows is None:
-        print("⚠️  Снимок кампаний получить не удалось — лист 'ads_campaigns' НЕ трогаем (остаётся прошлый снимок)")
-    else:
-        try:
-            ws_c = sh.worksheet('ads_campaigns')
-        except Exception:
-            ws_c = sh.add_worksheet(title='ads_campaigns', rows=100, cols=len(CAMP_HEADER))
-        ws_c.clear()
-        ws_c.append_row(CAMP_HEADER)
-        for i in range(0, len(camp_rows), 2000):
-            ws_c.append_rows(camp_rows[i:i + 2000], value_input_option='USER_ENTERED')
-        n_act = len({r[1] for r in camp_rows if r[3] == 9})
-        no_art = sum(1 for r in camp_rows if r[3] == 9 and not r[7])
-        print(f"✅ Снимок кампаний: {len({r[1] for r in camp_rows})} кампаний (активных {n_act}), строк {len(camp_rows)}"
-              + (f"; ⚠️ у {no_art} строк активных кампаний артикул не найден в nomenclature" if no_art else ""))
-except Exception as e:
-    print(f"⚠️  Снимок кампаний: неожиданная ошибка ({e}) — основная выгрузка продолжается")
+        raise RuntimeError('Wildberries не вернул полный снимок кампаний')
+    publish_updates(sh, prepare_update(sh, 'ads_campaigns', CAMP_HEADER, camp_rows))
+    print(f"✅ Снимок кампаний: {len({row[1] for row in camp_rows})} кампаний, {len(camp_rows)} строк")
+except Exception as error:
+    snapshot_failed = True
+    print(f"⚠️ Снимок кампаний: {error}. Основная выгрузка продолжается.")
 
 # ── 1. Список кампаний ────────────────────────────────────────────
 print("\n→ Шаг 1: Получаем список рекламных кампаний...")
 
 campaigns_resp = wb_get(f'{ADVERT_URL}/adv/v1/promotion/count')
-if not campaigns_resp:
+if not isinstance(campaigns_resp, dict) or not campaigns_resp:
     print("❌ Не удалось получить список кампаний — выходим")
     exit(1)
 
 all_advert_ids = []
 # fullstats поддерживает только кампании в статусах 7 (завершена), 9 (активна), 11 (на паузе)
 RELEVANT_STATUSES = {7, 9, 11}
-for group in campaigns_resp.get('adverts', []):
+for group in campaigns_resp.get('adverts') or []:
     status = group.get('status')
     for adv in group.get('advert_list', []):
         advert_id = adv.get('advertId')
@@ -251,7 +242,7 @@ print(f"  Кампаний для снятия статистики (стату�
 
 if not all_advert_ids:
     print("⚠️  Нет кампаний в подходящем статусе — писать нечего, выходим без ошибки")
-    exit(0)
+    exit(int(snapshot_failed))
 
 # ── 2. Статистика по кампаниям (пачками по 50, с учётом лимита 3/мин) ──
 print("\n→ Шаг 2: Получаем статистику (fullstats)...")
@@ -272,7 +263,7 @@ for bi, batch in enumerate(batches):
         'beginDate': DATE_FROM,
         'endDate': DATE_TO,
     })
-    if ok:
+    if ok and isinstance(resp, list):
         # ok=True и пустой resp — это НЕ сбой: по этим кампаниям за окно
         # просто нет статистики (пауза/завершены).
         if not resp:
@@ -348,52 +339,9 @@ if any_batch_failed:
     print("   неполными. Запусти скрипт ещё раз позже.")
     exit(1)
 
-is_new_sheet = False
-try:
-    ws = sh.worksheet('ads_history')
-    existing = ws.get_all_values()
-    if not existing:
-        ws.append_row(HEADERS_ROW)
-        existing_rows = []
-        is_new_sheet = True
-    else:
-        existing_rows = existing[1:]
-except Exception:
-    ws = sh.add_worksheet(title='ads_history', rows=200000, cols=len(HEADERS_ROW))
-    ws.append_row(HEADERS_ROW)
-    existing_rows = []
-    is_new_sheet = True
-    print("  Лист 'ads_history' создан")
-
-# ВАЖНО (исправлено): раньше строки с уже записанной датой просто
-# пропускались — значит если в первый раз за сегодня (рано утром) данные
-# были неполными, они такими и оставались НАВСЕГДА. Теперь вместо
-# "пропустить, если дата уже есть" — "выбросить старые строки за даты
-# из окна [DATE_FROM, DATE_TO] и записать их заново, целиком свежими".
-# Всё, что ВНЕ этого окна (более старые даты), не трогаем — как в finance.
-keep_rows = [r for r in existing_rows if len(r) > 0 and not (DATE_FROM <= r[0] <= DATE_TO)]
-dropped = len(existing_rows) - len(keep_rows)
-if dropped:
-    print(f"  Убрано старых строк за окно {DATE_FROM}–{DATE_TO} (будут перезаписаны свежими): {dropped}")
-
-final_rows = keep_rows + rows
-print(f"  Строк вне окна (не трогаем): {len(keep_rows)}, свежих за окно: {len(rows)}, итого: {len(final_rows)}")
-
-ws.clear()
-ws.append_row(HEADERS_ROW)
-batch_size = 2000
-for i in range(0, len(final_rows), batch_size):
-    batch = final_rows[i:i + batch_size]
-    ws.append_rows(batch, value_input_option='USER_ENTERED')
-    print(f"  Записано строк {i+1}–{i+len(batch)}")
-    time.sleep(1)
-
-ws.format('A1:K1', {
-    'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
-    'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18},
-})
-ws.freeze(rows=1, cols=2)
-
-print(f"\n✅ Готово!")
-print(f"   Период (перезаписан): {DATE_FROM} — {DATE_TO}")
-print(f"   Итого строк в 'ads_history': {len(final_rows)}")
+updates = prepare_update(sh, 'ads_history', HEADERS_ROW, rows,
+                         date_from=DATE_FROM, date_to=DATE_TO, frozen_columns=2)
+publish_updates(sh, updates)
+print(f"✅ ads_history обновлён за {DATE_FROM} — {DATE_TO}")
+if snapshot_failed:
+    exit(1)
