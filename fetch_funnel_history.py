@@ -16,7 +16,7 @@
   • лист 'funnel_traffic' — новый: Дата | Артикул | nmID | Переходы в карточку | Корзина | Заказы | Выкупы | Сумма выкупов | Отмены
     по всем карточкам, у которых за день была хоть какая-то активность; хранится TRAFFIC_KEEP_DAYS дней (старые строки сверху удаляются).
   Конверсии (переход→корзина, корзина→заказ, переход→заказ) считаются в таблице формулами из этих счётчиков.
-  Запись листов: повтор при лимите Google (429) и перезапись только хвоста (окна), а не всего листа.
+  Запись листов: повтор при лимите Google (429) и атомарная публикация подготовленных строк обоих листов.
 
 Окно ПЕРЕЗАПИСЫВАЕТСЯ целиком при каждом запуске (воронка обновляется раз в час, данные
 за последние дни дозревают), всё, что старше окна, не трогается. Если хоть один день окна
@@ -29,7 +29,7 @@
 import os, sys, json, time, requests, gspread
 from datetime import datetime, timedelta
 from google.oauth2.service_account import Credentials
-from gspread.utils import rowcol_to_a1
+from sheets_history import prepare_update, publish_updates, sheets_retry
 
 TOKEN = os.environ['WB_TOKEN']
 HEADERS = {'Authorization': TOKEN, 'Content-Type': 'application/json'}
@@ -66,7 +66,7 @@ def post(body, label):
             w = 30 * (attempt + 1); print(f"  [{label}] {r.status_code} — повтор через {w}с"); time.sleep(w); continue
         if r.status_code == 200:
             try: return True, r.json()
-            except Exception: return True, {}
+            except ValueError: return False, None
         print(f"  [{label}] ОШИБКА {r.status_code}: {r.text[:500]}")
         return False, None
     return False, None
@@ -103,7 +103,10 @@ def fetch_day(day):
         if not ok:
             return None
         d = data.get('data', data) if isinstance(data, dict) else data
-        prods = d.get('products', []) if isinstance(d, dict) else (d or [])
+        prods = d.get('products') if isinstance(d, dict) else d
+        if not isinstance(prods, list):
+            print(f'  [{day}] WB вернул ответ без списка товаров')
+            return None
         for p in prods:
             pr = p.get('product', {}); sel = (p.get('statistic') or {}).get('selected', {})
             if not _seen_keys and sel:
@@ -148,84 +151,14 @@ if failed:
 # ── 2. Запись листов ─────────────────────────────────────────────
 creds = Credentials.from_service_account_info(json.loads(os.environ['GOOGLE_CREDENTIALS']),
         scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive'])
-sh = gspread.authorize(creds).open_by_key(os.environ['SPREADSHEET_ID'])
+sh = sheets_retry(gspread.authorize(creds).open_by_key, os.environ['SPREADSHEET_ID'])
 HEADER = ['Дата', 'Артикул поставщика', 'nmID', 'Заказы, шт', 'Сумма заказов, ₽']
 HEADER_TR = ['Дата', 'Артикул поставщика', 'nmID', 'Переходы в карточку, шт', 'Корзина, шт', 'Заказы, шт', 'Выкупы, шт', 'Сумма выкупов, ₽', 'Отмены, шт']
-BATCH = 2000
 
-
-def gs_retry(fn, *args, **kwargs):
-    """Квота Google Sheets на запись — ~60 запросов в минуту на сервисный аккаунт (все магазины делят её). При 429/5xx ждём и повторяем."""
-    for attempt in range(8):
-        try:
-            return fn(*args, **kwargs)
-        except gspread.exceptions.APIError as e:
-            code = getattr(e, 'code', None) or getattr(getattr(e, 'response', None), 'status_code', None)
-            if code in (429, 500, 502, 503):
-                wait = 65 + 15 * attempt
-                print(f"  ⏳ Google Sheets {code} (квота записи) — жду {wait}с и повторяю ({attempt + 1}/8)..."); time.sleep(wait); continue
-            raise
-    raise RuntimeError('Google Sheets: не удалось выполнить запись после 8 попыток')
-
-
-def norm_day(v):
-    v = str(v).strip()
-    if len(v) >= 10 and v[4] == '-' and v[7] == '-': return v[:10]
-    if len(v) >= 10 and v[2] == '.' and v[5] == '.': return f"{v[6:10]}-{v[3:5]}-{v[0:2]}"
-    return v
-
-
-def get_sheet(name, header):
-    try:
-        ws = sh.worksheet(name)
-        return ws, gs_retry(ws.get_all_values)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=name, rows=1000, cols=len(header))
-        print(f"  Лист '{name}' создан")
-        return ws, []
-
-
-def write_sheet(name, header, fresh_rows, keep_old_days=None):
-    """Строки вне окна не трогаем; окно пишем заново. Если старые строки лежат первыми и без изменений — стираем и пишем только ХВОСТ
-    (≈4 запроса вместо ~10+), иначе (первый запуск, изменилась шапка/порядок) — полная перезапись."""
-    ws, existing = get_sheet(name, header)
-    ex_header = existing[0] if existing else []
-    data = existing[1:] if existing else []
-    if keep_old_days is not None:                                      # скользящее хранение: убираем из начала листа строки старше cutoff
-        cutoff = (now - timedelta(days=keep_old_days)).strftime('%Y-%m-%d')
-        k = 0
-        while k < len(data) and data[k] and norm_day(data[k][0]) < cutoff: k += 1
-        if k and ex_header == header:
-            gs_retry(ws.delete_rows, 2, 1 + k); data = data[k:]
-            print(f"  [{name}] удалено строк старше {keep_old_days} дн.: {k}")
-    keep = [r for r in data if r and not (DATE_FROM <= norm_day(r[0]) <= DATE_TO)]
-    print(f"\n[{name}] строк вне окна (не трогаем): {len(keep)}, убрано за окно: {len(data) - len(keep)}, свежих: {len(fresh_rows)}")
-    final_rows = keep + fresh_rows
-    prefix_ok = bool(existing) and ex_header == header and data[:len(keep)] == keep
-    def append_batches(rows):
-        for i in range(0, len(rows), BATCH):
-            gs_retry(ws.append_rows, rows[i:i + BATCH], value_input_option='USER_ENTERED')
-            print(f"  [{name}] записано {min(i + BATCH, len(rows))} из {len(rows)}"); time.sleep(2)
-    if prefix_ok:
-        first_tail = len(keep) + 2
-        if ws.row_count >= first_tail:
-            gs_retry(ws.batch_clear, [f"A{first_tail}:{rowcol_to_a1(ws.row_count, len(header))}"])
-        append_batches(fresh_rows)
-    else:
-        print(f"  [{name}] полная перезапись листа (первый запуск или изменилась шапка/порядок строк)")
-        gs_retry(ws.clear); gs_retry(ws.append_row, header); append_batches(final_rows)
-        try:
-            ws.format(f"A1:{rowcol_to_a1(1, len(header))}", {'textFormat': {'bold': True, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
-                                                         'backgroundColor': {'red': 0.18, 'green': 0.18, 'blue': 0.18}})
-            ws.freeze(rows=1)
-        except Exception: pass
-    n_sheet = len(gs_retry(ws.get_all_values)) - 1
-    if n_sheet != len(final_rows):
-        print(f"⚠ [{name}] в листе {n_sheet} строк, ожидали {len(final_rows)}. Запустите скрипт ещё раз — окно перезабирается целиком, это безопасно."); return False
-    print(f"✅ [{name}] итого строк: {len(final_rows)}")
-    return True
-
-
-ok1 = write_sheet('funnel_history', HEADER, fresh)
-ok2 = write_sheet('funnel_traffic', HEADER_TR, fresh_tr, keep_old_days=TRAFFIC_KEEP_DAYS)
-if not (ok1 and ok2): sys.exit(1)
+cutoff = (now - timedelta(days=TRAFFIC_KEEP_DAYS)).strftime('%Y-%m-%d')
+updates = prepare_update(sh, 'funnel_history', HEADER, fresh,
+                         date_from=DATE_FROM, date_to=DATE_TO)
+updates += prepare_update(sh, 'funnel_traffic', HEADER_TR, fresh_tr,
+                          date_from=DATE_FROM, date_to=DATE_TO, cutoff=cutoff)
+publish_updates(sh, updates)
+print("✅ funnel_history и funnel_traffic обновлены")
