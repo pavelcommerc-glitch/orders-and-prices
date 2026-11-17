@@ -11,14 +11,19 @@ on:
         required: false
         default: ''
   schedule:
-    - cron: '30 4 * * *'   # после sales (04:00), до finance (05:00)
+    - cron: '10 * * * *'
+
+concurrency:
+  group: rnp-funnel-ads-sheets
+  queue: max
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60    # первичное заполнение за 30 дней ≈ 15 мин на магазин (лимит ~3 запроса/мин)
+    timeout-minutes: ${{ github.event_name == 'schedule' && 90 || 180 }}
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
         store: [MOTORKRAFT, B, F, G, R, T, Z]
     steps:
@@ -28,7 +33,22 @@ jobs:
           python-version: '3.11'
       - run: pip install gspread google-auth requests
       - name: Run for ${{ matrix.store }}
-        run: python fetch_funnel_history.py
+        run: |
+          attempt_timeout=25m
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            attempt_timeout=55m
+          fi
+          for attempt in 1 2 3; do
+            if timeout --kill-after=15s "$attempt_timeout" python -u fetch_funnel_history.py; then
+              exit 0
+            fi
+            if (( attempt < 3 )); then
+              delay=$((75 * attempt))
+              echo "::warning::Попытка ${attempt} завершилась ошибкой. Повтор через ${delay} с."
+              sleep "$delay"
+            fi
+          done
+          exit 1
         env:
           WB_TOKEN: ${{ matrix.store == 'MOTORKRAFT' && secrets.WB_TOKEN || secrets[format('WB_TOKEN_{0}', matrix.store)] }}
           SPREADSHEET_ID: ${{ matrix.store == 'MOTORKRAFT' && secrets.SPREADSHEET_ID || secrets[format('SPREADSHEET_ID_{0}', matrix.store)] }}
